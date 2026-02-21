@@ -1,0 +1,44 @@
+# Environment and secrets
+.env
+.env.live
+.env.*.local
+src/.env.live
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+*.log
+*.log.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Old/personal docs
+README1.md
+GUIDE.md
+PAPER_TEST.md
+analysis/
