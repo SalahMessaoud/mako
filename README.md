@@ -1,11 +1,19 @@
-# Mako v3.0 — Solana Trading Engine
+<p align="center">
+  <img src="screenshots/logo.png" alt="Mako" width="120"/>
+</p>
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Solana](https://img.shields.io/badge/chain-Solana-9945FF.svg)](https://solana.com)
-[![pump.fun](https://img.shields.io/badge/DEX-pump.fun-orange.svg)](https://pump.fun)
+<h1 align="center">Mako v3.0 — Solana Trading Engine</h1>
 
-Multi-strategy Solana trading engine with 3-stage discovery pipeline, real-time rug detection, copy-sell mirroring, and Telegram GUI. Not just a sniper.
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"/></a>
+  <a href="https://solana.com"><img src="https://img.shields.io/badge/chain-Solana-9945FF.svg" alt="Solana"/></a>
+  <a href="https://pump.fun"><img src="https://img.shields.io/badge/DEX-pump.fun-orange.svg" alt="pump.fun"/></a>
+</p>
+
+<p align="center">
+  Multi-strategy Solana trading engine with 3-stage discovery pipeline, real-time rug detection, copy-sell mirroring, and Telegram GUI. Not just a sniper.
+</p>
 
 <p align="center">
   <img src="screenshots/telegram-dashboard.png" alt="Mako Telegram Dashboard" width="350"/>
