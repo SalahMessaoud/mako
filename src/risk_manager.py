@@ -357,11 +357,11 @@ class RiskManager:
                 if pos.strategy == "momentum"
                 else self.cfg.stop_loss_pct)
 
-        # 2-minute no-stop window: meme coins swing 15-20% routinely
-        # in the first 2 min. Only catastrophic override (3x stop) active.
-        in_nostop_window = pos.age_sec < 120
+        # No-stop window: meme coins swing 15-20% routinely early on.
+        # Only catastrophic override active during this window.
+        in_nostop_window = pos.age_sec < self.cfg.nostop_window_sec
         if in_nostop_window:
-            stop = stop * 3  # effectively 36% for momentum, 30% for others
+            stop = stop * self.cfg.nostop_multiplier
 
         # Curve-aware stop-loss: if curve is >60% and still rising toward
         # graduation, suppress the price-based stop-loss. The token is

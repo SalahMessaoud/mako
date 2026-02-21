@@ -206,7 +206,20 @@ MAX_HOLD_MINUTES=30
 STALE_EXIT_MINUTES=10
 STALE_EXIT_PCT=7
 GRADUATED_TRAILING_2_PCT=35
+FAST_STOP_GRACE_SEC=180
+NOSTOP_WINDOW_SEC=180
+NOSTOP_MULTIPLIER=4
+WS_STOP_LOSS_ENABLED=false
 ```
+
+**Exit timing parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `FAST_STOP_GRACE_SEC` | 180 | Seconds after buy before the fast stop-loss checker can trigger. Prevents exits on entry slippage. |
+| `NOSTOP_WINDOW_SEC` | 180 | Seconds after buy during which the stop-loss threshold is widened (multiplied by `NOSTOP_MULTIPLIER`). |
+| `NOSTOP_MULTIPLIER` | 4 | Stop-loss multiplier during the no-stop window. E.g. 12% stop becomes 48% during the window. |
+| `WS_STOP_LOSS_ENABLED` | false | Whether WebSocket-derived prices can trigger stop-losses. Disabled by default because single-trade implied prices are noisy. WS take-profits still fire. |
 
 The exit cascade:
 
@@ -729,11 +742,19 @@ The risk manager evaluates 9 exit conditions on every position check (every 3 se
 8. **Stale exit** -- flat position (within +/- 7%) for 10+ minutes
 9. **Time exit** -- exceeds max hold duration
 
-**Stop-loss confirmation:** Price must stay below the stop threshold for 8 seconds to trigger, filtering out momentary volatility spikes. Catastrophic dumps (3x threshold) trigger immediate exit.
+**Fast stop-loss grace:** The fast stop-loss checker (500ms polling) does not fire until `FAST_STOP_GRACE_SEC` (default 180s) after entry. This prevents exits from entry slippage and normal early volatility.
+
+**No-stop window:** For `NOSTOP_WINDOW_SEC` (default 180s) after entry, the stop-loss threshold is multiplied by `NOSTOP_MULTIPLIER` (default 4x), requiring a much larger drop to trigger. This applies in both the fast checker and the main poll loop.
+
+**Stop-loss confirmation:** Price must stay below the stop threshold for 8 seconds to trigger, filtering out momentary volatility spikes. Catastrophic dumps (multiplier x threshold) trigger immediate exit.
+
+**WebSocket stop-losses:** Disabled by default (`WS_STOP_LOSS_ENABLED=false`). Single-trade implied prices are noisy and trigger false stop-losses. WS take-profits and trailing stops still fire normally.
 
 **Curve-protected mode:** When the bonding curve is above 60% and rising with fresh data (< 30s old), the stop-loss is suppressed to allow the token to reach graduation. Only -80% dumps or 15%+ curve drops trigger exit.
 
 **Graduation grace period:** For 5 minutes after a token graduates, stop-loss is suppressed to survive the Raydium migration price dip.
+
+**Balance confirmation on sells:** After a live sell transaction, the bot retries the balance check up to 3 times (2s, 4s delays) to avoid recording 0 SOL received due to RPC lag.
 
 ### Loss Cooldowns
 
@@ -864,7 +885,7 @@ TELEGRAM_CHAT_ID=987654321
 **Settings**
 - Current values for all key parameters
 - Tap any setting to see preset buttons or enter a custom value
-- Configurable: Stop Loss, Take Profit, TP2, Trailing, Max Buy, Confidence, Growth, Growth Rate, Max Hold, Slippage
+- Configurable: Stop Loss, Take Profit, TP2, Trailing, Max Buy, Confidence, Growth, Growth Rate, Max Hold, Slippage, Fast Stop Grace, No-Stop Window, No-Stop Multiplier
 
 **Strategies**
 - Toggle individual strategies on/off without restart

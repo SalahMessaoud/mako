@@ -89,6 +89,10 @@ class Config:
     pipeline_max_top_holder_pct: float = 50.0
 
     # Exits
+    fast_stop_grace_sec: int = 180
+    nostop_window_sec: int = 180
+    nostop_multiplier: float = 4.0
+    ws_stop_loss_enabled: bool = False
     stop_loss_pct: float = 10.0
     momentum_stop_loss_pct: float = 12.0
     take_profit_pct: float = 100.0
@@ -193,6 +197,10 @@ class Config:
             sniper_min_dev_buy_sol=_safe_float("SNIPER_MIN_DEV_BUY_SOL", "0.5"),
             sniper_max_top_holder_pct=_safe_float("SNIPER_MAX_TOP_HOLDER_PCT", "70"),
             pipeline_max_top_holder_pct=_safe_float("PIPELINE_MAX_TOP_HOLDER_PCT", "50"),
+            fast_stop_grace_sec=_safe_int("FAST_STOP_GRACE_SEC", "180"),
+            nostop_window_sec=_safe_int("NOSTOP_WINDOW_SEC", "180"),
+            nostop_multiplier=_safe_float("NOSTOP_MULTIPLIER", "4"),
+            ws_stop_loss_enabled=os.getenv("WS_STOP_LOSS_ENABLED", "false").lower() == "true",
             stop_loss_pct=_safe_float("STOP_LOSS_PCT", "10"),
             momentum_stop_loss_pct=_safe_float("MOMENTUM_STOP_LOSS_PCT", "12"),
             take_profit_pct=_safe_float("TAKE_PROFIT_PCT", "100"),

@@ -551,8 +551,7 @@ class MemeBot:
 
                     # Grace period: don't fast-exit early after buy.
                     # Entry slippage + fees cause phantom losses that recover.
-                    grace = 15 if pos.strategy == "momentum" else 10
-                    if pos.age_sec < grace:
+                    if pos.age_sec < self.cfg.fast_stop_grace_sec:
                         continue
 
                     # Strategy-specific stop loss
@@ -560,12 +559,12 @@ class MemeBot:
                             if pos.strategy == "momentum"
                             else self.cfg.stop_loss_pct)
 
-                    # 2-minute no-stop window: meme coins swing 15-20% routinely
-                    # in the first 2 min. Only allow catastrophic override (3x stop)
-                    # during this window to avoid killing correct signals early.
-                    in_nostop_window = pos.age_sec < 120
+                    # No-stop window: meme coins swing 15-20% routinely
+                    # early on. Only allow catastrophic override during this
+                    # window to avoid killing correct signals early.
+                    in_nostop_window = pos.age_sec < self.cfg.nostop_window_sec
                     if in_nostop_window:
-                        stop = stop * 3  # only catastrophic dumps trigger
+                        stop = stop * self.cfg.nostop_multiplier
 
                     danger_threshold = -(stop / 2)
 
@@ -775,8 +774,11 @@ class MemeBot:
                         implied_price_usd = implied_price_sol * sol_price
                         action, sell_pct = self.risk.check_exits(mint, implied_price_usd)
                         if action != "none" and sell_pct > 0:
-                            log.warning(f"  WS-EXIT: {self.risk.positions[mint].symbol} — {action}")
-                            await self._execute_sell(mint, sell_pct, f"ws_{action}")
+                            # WS prices are noisy (single-trade implied) —
+                            # block stop-losses unless explicitly enabled
+                            if "stop" not in action or self.cfg.ws_stop_loss_enabled:
+                                log.warning(f"  WS-EXIT: {self.risk.positions[mint].symbol} — {action}")
+                                await self._execute_sell(mint, sell_pct, f"ws_{action}")
                             return
             except Exception as e:
                 log.debug(f"  WS price check error: {e}")
@@ -2045,6 +2047,25 @@ class MemeBot:
             else:
                 await self._sell_via_pumpportal(mint, pos, sell_pct, is_partial, reason)
 
+    async def _get_sol_received(self, sol_before: float, pos,
+                                retries: int = 3) -> float:
+        """Get SOL received after a sell tx, retrying if balance unchanged.
+
+        RPC may not reflect the new balance immediately after tx confirmation.
+        Retries with short delays to avoid recording 0 SOL on valid sells.
+        """
+        for attempt in range(retries):
+            sol_after = self.wallet.get_sol_balance()
+            sol_received = max(sol_after - sol_before, 0)
+            if sol_received > 0:
+                return sol_received
+            if attempt < retries - 1:
+                wait = 2 * (attempt + 1)  # 2s, 4s
+                log.info(f"  Balance unchanged after sell of {pos.symbol}, "
+                         f"retrying in {wait}s ({attempt + 1}/{retries})")
+                await asyncio.sleep(wait)
+        return 0.0
+
     async def _sell_via_jupiter(self, mint: str, pos, sell_pct: int,
                                 is_partial: bool, reason: str):
         """Sell graduated tokens through Jupiter V6."""
@@ -2072,14 +2093,11 @@ class MemeBot:
         )
         if tx:
             sell_pnl = None
+            sol_received = await self._get_sol_received(sol_before, pos)
             if is_partial:
-                sol_after = self.wallet.get_sol_balance()
-                sol_received = max(sol_after - sol_before, 0)
                 self.risk.partial_close(mint, sol_received=sol_received,
                                         reason=f"{reason} (jupiter)")
             else:
-                sol_after = self.wallet.get_sol_balance()
-                sol_received = max(sol_after - sol_before, 0)
                 sell_pnl = self.risk.close(mint, sol_received, reason, tx)
                 await self._on_position_closed(mint, pnl=sell_pnl,
                                                strategy=pos.strategy, creator=pos.creator)
@@ -2107,14 +2125,11 @@ class MemeBot:
         )
         if tx:
             sell_pnl = None
+            sol_received = await self._get_sol_received(sol_before, pos)
             if is_partial:
-                sol_after = self.wallet.get_sol_balance()
-                sol_received = max(sol_after - sol_before, 0)
                 self.risk.partial_close(mint, sol_received=sol_received,
                                         reason=reason)
             else:
-                sol_after = self.wallet.get_sol_balance()
-                sol_received = max(sol_after - sol_before, 0)
                 sell_pnl = self.risk.close(mint, sol_received, reason, tx)
                 await self._on_position_closed(mint, pnl=sell_pnl,
                                                strategy=pos.strategy, creator=pos.creator)
@@ -2148,8 +2163,7 @@ class MemeBot:
                 skip_jito=True,
             )
             if tx2:
-                sol_after2 = self.wallet.get_sol_balance()
-                sol_received2 = max(sol_after2 - sol_before2, 0)
+                sol_received2 = await self._get_sol_received(sol_before2, pos)
                 sell_pnl2 = None
                 if not is_partial:
                     sell_pnl2 = self.risk.close(mint, sol_received2, reason, tx2)

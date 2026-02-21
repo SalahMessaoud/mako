@@ -20,6 +20,9 @@ SETTINGS = {
     "rate": ("min_momentum_growth_rate", float, [3, 5, 8, 12], 1, 30, "Growth Rate %/min"),
     "hold": ("max_hold_minutes", int, [10, 20, 30, 60], 5, 120, "Max Hold Min"),
     "slip": ("slippage_pct", int, [10, 15, 20, 25], 5, 50, "Slippage %"),
+    "fsg":  ("fast_stop_grace_sec", int, [60, 120, 180, 300], 10, 600, "Fast Stop Grace (s)"),
+    "nsw":  ("nostop_window_sec", int, [60, 120, 180, 300], 30, 600, "No-Stop Window (s)"),
+    "nsm":  ("nostop_multiplier", float, [2, 3, 4, 5], 1, 10, "No-Stop Multiplier"),
 }
 
 
