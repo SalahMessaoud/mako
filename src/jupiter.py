@@ -23,12 +23,21 @@ class JupiterSwap:
     RETRY_DELAY = 1.5
 
     def __init__(self, rpc_url: str, keypair: Keypair = None,
-                 slippage_bps: int = 1500, jito_sender=None):
+                 slippage_bps: int = 1500, jito_sender=None,
+                 fallback_rpc_url: str = ""):
         self.rpc_url = rpc_url
+        self._fallback_rpc_url = fallback_rpc_url
         self.keypair = keypair
         self.slippage_bps = slippage_bps
         self._jito_sender = jito_sender  # async callable: (VersionedTransaction) -> str | None
         self.http = httpx.AsyncClient(timeout=20)
+
+    @property
+    def _rpc_urls(self) -> list[str]:
+        urls = [self.rpc_url]
+        if self._fallback_rpc_url:
+            urls.append(self._fallback_rpc_url)
+        return urls
 
     async def sell_token(self, mint: str, raw_amount: int, slippage_bps: int = None,
                          use_jito: bool = True) -> str | None:
@@ -182,14 +191,19 @@ class JupiterSwap:
             max_retries=3,
         )
         send_req = SendVersionedTransaction(tx, send_cfg)
-        rpc_resp = await self.http.post(
-            self.rpc_url, content=send_req.to_json(),
-            headers={"Content-Type": "application/json"},
-        )
-        rpc_data = rpc_resp.json()
-        if "result" in rpc_data:
-            return rpc_data["result"]
-        log.error(f"  Jupiter {direction} RPC send error: {rpc_data.get('error', rpc_data)}")
+        for rpc_url in self._rpc_urls:
+            try:
+                rpc_resp = await self.http.post(
+                    rpc_url, content=send_req.to_json(),
+                    headers={"Content-Type": "application/json"},
+                )
+                rpc_data = rpc_resp.json()
+                if "result" in rpc_data:
+                    return rpc_data["result"]
+                log.warning(f"  Jupiter {direction} RPC send ({rpc_url[:30]}): "
+                            f"{rpc_data.get('error', rpc_data)}")
+            except Exception as e:
+                log.warning(f"  Jupiter {direction} RPC error ({rpc_url[:30]}): {e}")
         return None
 
     async def _confirm_tx(self, signature: str, timeout: int = 30) -> bool:
@@ -198,26 +212,28 @@ class JupiterSwap:
         poll_interval = 0.5
 
         while time.time() - start < timeout:
-            try:
-                resp = await self.http.post(self.rpc_url, json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getSignatureStatuses",
-                    "params": [[signature], {"searchTransactionHistory": False}],
-                })
-                data = resp.json()
-                value = data.get("result", {}).get("value", [None])[0]
+            for rpc_url in self._rpc_urls:
+                try:
+                    resp = await self.http.post(rpc_url, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getSignatureStatuses",
+                        "params": [[signature], {"searchTransactionHistory": False}],
+                    })
+                    data = resp.json()
+                    value = data.get("result", {}).get("value", [None])[0]
 
-                if value:
-                    if value.get("err"):
-                        log.warning(f"  Jupiter tx failed on-chain: {value['err']}")
-                        return False
-                    status = value.get("confirmationStatus", "")
-                    if status in ("confirmed", "finalized"):
-                        elapsed = time.time() - start
-                        log.info(f"  Jupiter tx confirmed ({status}) in {elapsed:.1f}s")
-                        return True
-            except Exception as e:
-                log.debug(f"  Jupiter confirm poll error: {e}")
+                    if value:
+                        if value.get("err"):
+                            log.warning(f"  Jupiter tx failed on-chain: {value['err']}")
+                            return False
+                        status = value.get("confirmationStatus", "")
+                        if status in ("confirmed", "finalized"):
+                            elapsed = time.time() - start
+                            log.info(f"  Jupiter tx confirmed ({status}) in {elapsed:.1f}s")
+                            return True
+                    break  # got a valid response, no need to try fallback
+                except Exception as e:
+                    log.debug(f"  Jupiter confirm poll error ({rpc_url[:30]}): {e}")
 
             await asyncio.sleep(poll_interval)
             poll_interval = min(poll_interval * 1.5, 3.0)

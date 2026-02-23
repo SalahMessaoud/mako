@@ -205,6 +205,7 @@ class MemeBot:
             config.rpc_url, keypair, config.pumpportal_api_key,
             use_jito=(config.use_jito and not config.paper_trading),
             jito_tip_sol=config.jito_tip_sol,
+            fallback_rpc_url=config.fallback_rpc_url,
         )
 
         # Jupiter swap client (for selling graduated tokens)
@@ -213,6 +214,7 @@ class MemeBot:
             slippage_bps=config.jupiter_slippage_bps,
             jito_sender=(self.pump._send_jito_bundle
                          if self.pump.use_jito else None),
+            fallback_rpc_url=config.fallback_rpc_url,
         )
         self._graduated_cache: dict[str, bool] = {}
 

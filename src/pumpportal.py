@@ -53,14 +53,23 @@ class PumpPortal:
     ]
 
     def __init__(self, rpc_url: str, keypair: Keypair = None, api_key: str = "",
-                 use_jito: bool = False, jito_tip_sol: float = 0.001):
+                 use_jito: bool = False, jito_tip_sol: float = 0.001,
+                 fallback_rpc_url: str = ""):
         self.rpc_url = rpc_url
+        self._fallback_rpc_url = fallback_rpc_url
         self.keypair = keypair
         self.api_key = api_key
         self.use_jito = use_jito
         self.jito_tip_sol = jito_tip_sol
         self.http = httpx.AsyncClient(timeout=15)
         self.tx_history: list[dict] = []
+
+    @property
+    def _rpc_urls(self) -> list[str]:
+        urls = [self.rpc_url]
+        if self._fallback_rpc_url:
+            urls.append(self._fallback_rpc_url)
+        return urls
 
     # ── Trading with Retry ────────────────────────────────────
 
@@ -145,31 +154,32 @@ class PumpPortal:
         poll_interval = 0.4 if fixed_interval else 0.5
 
         while time.time() - start < timeout:
-            try:
-                resp = await self.http.post(self.rpc_url, json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getSignatureStatuses",
-                    "params": [[signature], {"searchTransactionHistory": False}],
-                })
-                data = resp.json()
-                result = data.get("result", {})
-                value = result.get("value", [None])[0]
+            for rpc_url in self._rpc_urls:
+                try:
+                    resp = await self.http.post(rpc_url, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getSignatureStatuses",
+                        "params": [[signature], {"searchTransactionHistory": False}],
+                    })
+                    data = resp.json()
+                    result = data.get("result", {})
+                    value = result.get("value", [None])[0]
 
-                if value:
-                    status = value.get("confirmationStatus", "")
-                    err = value.get("err")
+                    if value:
+                        status = value.get("confirmationStatus", "")
+                        err = value.get("err")
 
-                    if err:
-                        log.warning(f"  Tx failed on-chain: {err}")
-                        return False
+                        if err:
+                            log.warning(f"  Tx failed on-chain: {err}")
+                            return False
 
-                    if status in ("confirmed", "finalized"):
-                        elapsed = time.time() - start
-                        log.info(f"  Tx confirmed ({status}) in {elapsed:.1f}s: {signature[:16]}...")
-                        return True
-
-            except Exception as e:
-                log.debug(f"  Confirm poll error: {e}")
+                        if status in ("confirmed", "finalized"):
+                            elapsed = time.time() - start
+                            log.info(f"  Tx confirmed ({status}) in {elapsed:.1f}s: {signature[:16]}...")
+                            return True
+                    break  # got a valid response, no need to try fallback
+                except Exception as e:
+                    log.debug(f"  Confirm poll error ({rpc_url[:30]}): {e}")
 
             await asyncio.sleep(poll_interval)
             if not fixed_interval:
@@ -180,21 +190,24 @@ class PumpPortal:
 
     async def get_tx_result(self, signature: str) -> dict | None:
         """Get full transaction result (for balance change calculation)."""
-        try:
-            resp = await self.http.post(self.rpc_url, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTransaction",
-                "params": [signature, {
-                    "encoding": "jsonParsed",
-                    "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0,
-                }],
-            })
-            data = resp.json()
-            return data.get("result")
-        except Exception as e:
-            log.debug(f"  Get tx error: {e}")
-            return None
+        for rpc_url in self._rpc_urls:
+            try:
+                resp = await self.http.post(rpc_url, json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTransaction",
+                    "params": [signature, {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 0,
+                    }],
+                })
+                data = resp.json()
+                result = data.get("result")
+                if result:
+                    return result
+            except Exception as e:
+                log.debug(f"  Get tx error ({rpc_url[:30]}): {e}")
+        return None
 
     # ── Trade Execution ───────────────────────────────────────
 
@@ -274,14 +287,18 @@ class PumpPortal:
                 max_retries=3,
             )
             send_req = SendVersionedTransaction(tx, send_cfg)
-            rpc_resp = await self.http.post(
-                self.rpc_url, content=send_req.to_json(),
-                headers={"Content-Type": "application/json"},
-            )
-            rpc_data = rpc_resp.json()
-            if "result" in rpc_data:
-                return rpc_data["result"]
-            log.error(f"RPC send: {rpc_data.get('error', rpc_data)}")
+            for rpc_url in self._rpc_urls:
+                try:
+                    rpc_resp = await self.http.post(
+                        rpc_url, content=send_req.to_json(),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    rpc_data = rpc_resp.json()
+                    if "result" in rpc_data:
+                        return rpc_data["result"]
+                    log.warning(f"RPC send ({rpc_url[:30]}): {rpc_data.get('error', rpc_data)}")
+                except Exception as e:
+                    log.warning(f"RPC send error ({rpc_url[:30]}): {e}")
             return None
         except Exception as e:
             log.error(f"Local trade error: {e}")
