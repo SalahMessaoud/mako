@@ -550,10 +550,9 @@ class MemeBot:
                     if pos.entry_price <= 0:
                         continue
 
-                    # Grace period: don't fast-exit early after buy.
-                    # Entry slippage + fees cause phantom losses that recover.
-                    if pos.age_sec < self.cfg.fast_stop_grace_sec:
-                        continue
+                    # Grace period: don't fast-exit early after buy
+                    # EXCEPT for catastrophic dumps (>50% loss).
+                    in_grace = pos.age_sec < self.cfg.fast_stop_grace_sec
 
                     # Strategy-specific stop loss
                     stop = (self.cfg.momentum_stop_loss_pct
@@ -582,6 +581,10 @@ class MemeBot:
                         continue
 
                     pnl_pct = ((price_usd - pos.entry_price) / pos.entry_price) * 100
+
+                    # During grace period, only act on catastrophic dumps (>50%)
+                    if in_grace and pnl_pct > -50:
+                        continue
 
                     # Only act on positions in the danger zone
                     if pnl_pct > danger_threshold:
@@ -1405,25 +1408,30 @@ class MemeBot:
 
                 # Prefer post-dump entries: tokens with negative/low 5m%
                 # have already shed FOMO buyers and found a floor.
-                # Skip high positive 5m — likely buying the top.
+                # Skip extreme FOMO tops and deep dumps.
                 change_5m = token_data.price_change_5m
-                if change_5m > 80:
+                if change_5m > 150:
                     log.info(f"  POST-GRAD: {symbol} — FOMO top ({change_5m:+.0f}% 5m), skipping")
                     self.graduation.mark_bought(mint)
                     continue
-                if change_5m < -50:
+                if change_5m < -30:
                     log.info(f"  POST-GRAD: {symbol} — too deep ({change_5m:+.0f}% 5m), skipping")
                     self.graduation.mark_bought(mint)
                     continue
 
-                # Confidence: boost for negative 5m (post-dump floor),
-                # penalize for high positive (chasing)
-                if change_5m <= -5:
-                    conf = 0.80
+                # Confidence/sizing gradient: post-dump floor gets largest
+                # position, chasing gets smallest. Wider spread to reflect
+                # 80% vs 20% win rate difference in backtest data.
+                if -15 <= change_5m <= -5:
+                    conf = 0.85  # sweet spot: post-dump floor
+                elif change_5m < -15:
+                    conf = 0.65  # deeper dip, less data, cautious
                 elif change_5m <= 10:
-                    conf = 0.75
+                    conf = 0.75  # calm entry
+                elif change_5m <= 50:
+                    conf = 0.55  # chasing, minimal edge
                 else:
-                    conf = 0.65
+                    conf = 0.50  # high FOMO, smallest size
 
                 log.info(f"  POST-GRAD BUY: {symbol} | liq=${token_data.liquidity_usd:,.0f} | "
                          f"5m={change_5m:+.1f}% | mcap=${token_data.market_cap:,.0f}")
