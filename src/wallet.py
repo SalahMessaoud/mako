@@ -16,8 +16,13 @@ log = logging.getLogger(__name__)
 class Wallet:
     """Real Solana wallet for live trading."""
 
-    def __init__(self, rpc_url: str, private_key: str):
+    def __init__(self, rpc_url: str, private_key: str,
+                 fallback_rpc_url: str = ""):
         self.client = Client(rpc_url, commitment=Confirmed)
+        self._fallback_client = (
+            Client(fallback_rpc_url, commitment=Confirmed)
+            if fallback_rpc_url else None
+        )
         key_bytes = base58.b58decode(private_key)
         self.keypair = Keypair.from_bytes(key_bytes)
         self.pubkey = str(self.keypair.pubkey())
@@ -29,29 +34,35 @@ class Wallet:
         return self.get_sol_balance()
 
     def get_sol_balance(self) -> float:
-        try:
-            resp = self.client.get_balance(Pubkey.from_string(self.pubkey))
-            bal = resp.value / 1e9
-            self._cached_balance = bal
-            return bal
-        except Exception as e:
-            log.error(f"Balance error: {type(e).__name__}: {e}")
-            return self._cached_balance
+        for client in [self.client, self._fallback_client]:
+            if not client:
+                continue
+            try:
+                resp = client.get_balance(Pubkey.from_string(self.pubkey))
+                bal = resp.value / 1e9
+                self._cached_balance = bal
+                return bal
+            except Exception as e:
+                log.error(f"Balance error: {type(e).__name__}: {e}")
+        return self._cached_balance
 
     def get_token_balance(self, mint: str) -> float:
-        try:
-            resp = self.client.get_token_accounts_by_owner_json_parsed(
-                Pubkey.from_string(self.pubkey),
-                TokenAccountOpts(mint=Pubkey.from_string(mint)),
-            )
-            if resp.value:
-                for acct in resp.value:
-                    info = acct.account.data.parsed["info"]
-                    return float(info["tokenAmount"]["uiAmount"] or 0)
-            return 0.0
-        except Exception as e:
-            log.error(f"Token balance error: {e}")
-            return 0.0
+        for client in [self.client, self._fallback_client]:
+            if not client:
+                continue
+            try:
+                resp = client.get_token_accounts_by_owner_json_parsed(
+                    Pubkey.from_string(self.pubkey),
+                    TokenAccountOpts(mint=Pubkey.from_string(mint)),
+                )
+                if resp.value:
+                    for acct in resp.value:
+                        info = acct.account.data.parsed["info"]
+                        return float(info["tokenAmount"]["uiAmount"] or 0)
+                return 0.0
+            except Exception as e:
+                log.error(f"Token balance error: {e}")
+        return 0.0
 
 
 @dataclass

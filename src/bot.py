@@ -196,7 +196,8 @@ class MemeBot:
             if not self.db.get_state("paper_initial_balance"):
                 self.db.set_state("paper_initial_balance", self.wallet.sol_balance)
         else:
-            self.wallet = Wallet(config.rpc_url, config.private_key)
+            self.wallet = Wallet(config.rpc_url, config.private_key,
+                                 config.fallback_rpc_url)
 
         # PumpPortal trading client (Jito only in live mode)
         keypair = getattr(self.wallet, 'keypair', None)
