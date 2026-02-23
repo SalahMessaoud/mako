@@ -58,6 +58,7 @@ class MintPool:
         self._unique_buyers: dict[str, set[str]] = {}
         self._total_buys: dict[str, int] = {}  # mint -> total buy count
         self._total_buy_sol: dict[str, float] = {}  # mint -> total SOL bought
+        self._total_trades: dict[str, int] = {}  # mint -> all trades (buys + sells)
 
     def add(self, event: dict):
         mint = event.get("mint", "")
@@ -87,6 +88,14 @@ class MintPool:
         self._total_buys[mint] += 1
         self._total_buy_sol[mint] += sol_amount
 
+    def record_trade(self, mint: str):
+        """Record any trade event (buy or sell) for activity counting."""
+        self._total_trades[mint] = self._total_trades.get(mint, 0) + 1
+
+    def get_trade_count(self, mint: str) -> int:
+        """Get total observed trades (buys + sells) from WebSocket events."""
+        return self._total_trades.get(mint, 0)
+
     def get_buyer_uniqueness(self, mint: str) -> tuple[float, int, int, float]:
         """Get buyer uniqueness metrics for a token.
 
@@ -108,6 +117,7 @@ class MintPool:
             self._unique_buyers.pop(m, None)
             self._total_buys.pop(m, None)
             self._total_buy_sol.pop(m, None)
+            self._total_trades.pop(m, None)
 
     def get_best_candidates(self, count: int = 30, min_age: int = 120) -> list[str]:
         """Score and rank candidates for on-chain activity check."""
@@ -727,10 +737,13 @@ class MemeBot:
         await self._execute_buy(signal)
 
     async def _on_token_trade(self, event: dict):
-        # Buyer uniqueness tracking for Sybil detection
+        # Track all trades (buys + sells) for activity counting
         trade_mint = event.get("mint", "")
         trade_type = event.get("txType", "")
         trader_pk = event.get("traderPublicKey", "")
+        if trade_mint:
+            self.mint_pool.record_trade(trade_mint)
+        # Buyer uniqueness tracking for Sybil detection
         if trade_type == "buy" and trade_mint and trader_pk:
             trade_sol = float(event.get("solAmount", 0) or 0)
             self.mint_pool.record_buyer(trade_mint, trader_pk, trade_sol)
@@ -816,6 +829,9 @@ class MemeBot:
             for mint in top_candidates[:10]:
                 try:
                     tx_count = await self.onchain.get_recent_tx_count(mint, seconds=300)
+                    # Fallback to WebSocket trade count when RPC fails/returns 0
+                    if tx_count == 0:
+                        tx_count = self.mint_pool.get_trade_count(mint)
                     if tx_count >= 5:
                         active_mints.append((mint, tx_count))
                 except Exception:
