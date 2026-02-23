@@ -1402,20 +1402,36 @@ class MemeBot:
                     log.info(f"  POST-GRAD: {symbol} — low liquidity ${token_data.liquidity_usd:,.0f}, waiting...")
                     continue
 
-                # Check price stability — don't buy if already dumping
-                if token_data.price_change_5m < -20:
-                    log.info(f"  POST-GRAD: {symbol} — dumping ({token_data.price_change_5m:.0f}% 5m), skipping")
+                # Prefer post-dump entries: tokens with negative/low 5m%
+                # have already shed FOMO buyers and found a floor.
+                # Skip high positive 5m — likely buying the top.
+                change_5m = token_data.price_change_5m
+                if change_5m > 80:
+                    log.info(f"  POST-GRAD: {symbol} — FOMO top ({change_5m:+.0f}% 5m), skipping")
+                    self.graduation.mark_bought(mint)
+                    continue
+                if change_5m < -50:
+                    log.info(f"  POST-GRAD: {symbol} — too deep ({change_5m:+.0f}% 5m), skipping")
                     self.graduation.mark_bought(mint)
                     continue
 
+                # Confidence: boost for negative 5m (post-dump floor),
+                # penalize for high positive (chasing)
+                if change_5m <= -5:
+                    conf = 0.80
+                elif change_5m <= 10:
+                    conf = 0.75
+                else:
+                    conf = 0.65
+
                 log.info(f"  POST-GRAD BUY: {symbol} | liq=${token_data.liquidity_usd:,.0f} | "
-                         f"5m={token_data.price_change_5m:+.1f}% | mcap=${token_data.market_cap:,.0f}")
+                         f"5m={change_5m:+.1f}% | mcap=${token_data.market_cap:,.0f}")
 
                 signal = Signal(
                     mint=mint, symbol=symbol, strategy="graduation",
-                    confidence=0.70,
+                    confidence=conf,
                     reason=f"Post-graduation | Liq: ${token_data.liquidity_usd:,.0f} | "
-                           f"5m: {token_data.price_change_5m:+.1f}%",
+                           f"5m: {change_5m:+.1f}%",
                     token_data=token_data, creator=creator,
                 )
                 self.graduation.mark_bought(mint)
