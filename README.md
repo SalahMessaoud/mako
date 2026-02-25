@@ -965,10 +965,13 @@ sqlite3 bot_state.db "SELECT COUNT(*) FROM creator_blacklist;"
 
 Used for buying and selling tokens still on the pump.fun bonding curve.
 
+- **Lightning mode (recommended):** PumpPortal builds and signs via their API — no RPC needed
 - **Local mode:** Bot builds transaction, signs with keypair, sends via RPC
-- **Lightning mode:** PumpPortal builds and signs via their API
+- **Fallback chain:** Lightning → Jito bundle → primary RPC → fallback RPC
 - **Retry logic:** 3 attempts with 1.5s, 3s, 4.5s delays
 - **Confirmation:** Polls `getSignatureStatuses` every 0.4s for up to 15 seconds
+
+When a PumpPortal API key is configured, Lightning mode is tried first. If it fails, the bot automatically falls back to local transaction signing via RPC. This ensures trades land even when one execution path is down.
 
 ### Jupiter V6 (Graduated Tokens)
 
@@ -977,7 +980,12 @@ Used for buying and selling tokens that have graduated to PumpSwap or Raydium.
 - Quote API for price discovery and route optimization
 - Swap API for transaction generation
 - Supports Jito bundle submission for MEV protection
+- **RPC fallback:** Primary RPC → fallback RPC for both sends and confirmations
 - Confirmation with exponential backoff (0.5s to 3s)
+
+### RPC Fallback
+
+All RPC-dependent operations (balance checks, trade sends, tx confirmations, tx lookups) try the primary RPC first and automatically fall back to `FALLBACK_RPC_URL` if it fails. The momentum pipeline also falls back to WebSocket trade counts when `getSignaturesForAddress` is unavailable on both RPCs.
 
 ### Jito MEV Bundles
 
@@ -992,8 +1000,8 @@ This provides faster transaction inclusion and front-running protection.
 ### Venue Selection
 
 The bot automatically selects the execution venue:
-- **Not graduated:** PumpPortal (bonding curve trade)
-- **Graduated:** Jupiter V6 (DEX swap through PumpSwap or Raydium)
+- **Not graduated:** PumpPortal (Lightning → local RPC)
+- **Graduated:** Jupiter V6 (Jito → primary RPC → fallback RPC)
 
 Graduation status is checked on-chain and cached per position.
 

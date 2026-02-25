@@ -215,15 +215,22 @@ class PumpPortal:
                              denominated_in_sol: bool, slippage: int,
                              priority_fee: float, pool: str,
                              skip_jito: bool = False) -> str | None:
+        # Try Lightning first (server-side, no RPC needed), fall back to local
         if self.api_key:
-            return await self._lightning_trade(action, mint, amount,
-                                               denominated_in_sol, slippage,
-                                               priority_fee, pool)
-        else:
+            sig = await self._lightning_trade(action, mint, amount,
+                                              denominated_in_sol, slippage,
+                                              priority_fee, pool)
+            if sig:
+                return sig
+            if self.keypair:
+                log.warning(f"  Lightning {action} failed, falling back to local RPC")
+
+        if self.keypair:
             return await self._local_trade(action, mint, amount,
                                             denominated_in_sol, slippage,
                                             priority_fee, pool,
                                             skip_jito=skip_jito)
+        return None
 
     async def _lightning_trade(self, action, mint, amount, denom_sol,
                                slippage, priority_fee, pool) -> str | None:
