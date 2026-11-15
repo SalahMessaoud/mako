@@ -650,3 +650,77 @@ class TradeFeed(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stream.trade_feed_rejected)
         self.assertEqual(stream.trade_events, 1)
         self.assertEqual(len(got), 1)
+
+
+# ───────────────────────── PAPER SELL PRICING ─────────────────────────
+
+class PaperSellPricing(Case):
+    cfg = dict(strategy="momentum", priority_fee_sol=0.0, use_jito=False,
+               paper_fee_pct=0.0, paper_slippage_pct=0.0, max_fee_pct_of_trade=0)
+
+    def hold(self, tokens=1_000_000.0, sol=0.15, graduated=False):
+        self.bot.wallet.buy(MINT, "TKN", sol, tokens, 0.00001)
+        return self.bot.risk.open(MINT, "TKN", 0.00001, 1e-7, tokens, sol,
+                                  "momentum", graduated=graduated)
+
+    def curve(self, v_sol, real_sol, v_tokens=5e14, complete=False):
+        self.bot.onchain.states[MINT] = BondingCurveState(
+            virtual_sol=v_sol, real_sol=real_sol, virtual_tokens=v_tokens,
+            real_tokens=3e14, complete=complete, pct=real_sol / 85 * 100)
+
+    async def test_rug_exit_is_priced_from_the_drained_curve_not_a_stale_quote(self):
+        # The GTN case: curve drained 34 -> 0.1 SOL, but market data still
+        # showed the pre-rug price and the paper sell booked +43%.
+        self.hold()
+        self.bot.market.token = token(price_sol=2.3e-7)      # stale: worth 0.23 SOL
+        self.curve(v_sol=30.1, real_sol=0.1)
+        await self.bot._execute_sell(MINT, 100, "Bonding curve dropped 100%")
+        self.assertNotIn(MINT, self.bot.risk.positions)
+        got = self.bot.wallet.sol_balance - (2.0 - 0.15)
+        self.assertLess(got, 0.07)                           # a loss, not +43%
+        self.assertGreater(got, 0)
+
+    async def test_curve_sale_cannot_return_more_sol_than_the_curve_holds(self):
+        pos = self.hold(tokens=400_000_000.0)                # a huge position
+        self.curve(v_sol=31.0, real_sol=1.0)
+        sol, _, source = await self.bot._paper_sell_quote(MINT, pos, pos.tokens)
+        self.assertEqual(source, "bonding curve")
+        self.assertLessEqual(sol, 1.0)
+
+    async def test_curve_quote_matches_constant_product_math(self):
+        pos = self.hold(tokens=1_000_000.0)
+        self.curve(v_sol=60.0, real_sol=30.0, v_tokens=5e14)
+        sol, price_usd, _ = await self.bot._paper_sell_quote(MINT, pos, pos.tokens)
+        self.assertAlmostEqual(sol, 60.0 * 1e12 / (5e14 + 1e12), places=9)
+        self.assertAlmostEqual(price_usd, 60.0 / (5e14 / 1e6) * 100.0, places=12)
+
+    async def test_graduated_token_uses_market_data(self):
+        pos = self.hold(graduated=True)
+        self.bot.market.token = token(price_sol=2e-7)
+        self.curve(v_sol=115.0, real_sol=0.0, complete=True)
+        sol, _, source = await self.bot._paper_sell_quote(MINT, pos, pos.tokens)
+        self.assertEqual(source, "market data")
+        self.assertAlmostEqual(sol, 0.2)
+
+    async def test_unreadable_curve_falls_back_to_market_data(self):
+        pos = self.hold()
+        self.bot.market.token = token(price_sol=2e-7)
+        sol, _, source = await self.bot._paper_sell_quote(MINT, pos, pos.tokens)
+        self.assertEqual(source, "market data")
+
+
+class GraduationExpiry(unittest.IsolatedAsyncioTestCase):
+    async def test_expired_candidate_is_not_detected_again(self):
+        # The SINERS case: an unbought graduate expired after 5 minutes and
+        # was then "detected" as graduating over and over.
+        oc = Onchain()
+        grad = GraduationStrategy(None, min_curve_pct=90, onchain=oc)
+        oc.pct[MINT] = 95.0
+        await grad.evaluate_trade({"mint": MINT})
+        oc.pct[MINT] = 100.0
+        await grad.evaluate_trade({"mint": MINT})
+        self.assertIn(MINT, grad._graduated_at)
+        grad._graduated_at[MINT] = time.time() - 1000        # past max_wait
+        self.assertEqual(grad.get_post_graduation_candidates(), [])
+        await grad.evaluate_trade({"mint": MINT})
+        self.assertNotIn(MINT, grad._graduated_at)

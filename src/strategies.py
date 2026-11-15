@@ -419,6 +419,9 @@ class GraduationStrategy:
                 continue
             age = now - grad_time
             if age > max_wait:
+                # Done with this token: without this it is still "seen
+                # below 100%" and would be detected as graduating again.
+                self.bought.add(mint)
                 expired.append(mint)
                 continue
             if age >= min_wait and mint in self._ready_to_buy:

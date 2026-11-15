@@ -306,6 +306,7 @@ class MemeBot:
             log.info("  Momentum strategy enabled")
 
         self._pipeline_rotation = 0
+        self._post_grad_logged: dict[str, str] = {}
         # mint -> (time, virtual SOL) at the previous pipeline evaluation
         self._curve_obs: dict[str, tuple[float, float]] = {}
         self._copy_event_count = 0  # Diagnostic counter
@@ -1603,10 +1604,10 @@ class MemeBot:
             try:
                 token_data = await self.market.get_token(mint)
                 if not token_data:
-                    log.info(f"  POST-GRAD: {symbol} — no DEX data yet, waiting...")
+                    self._post_grad_note(mint, f"  POST-GRAD: {symbol} — no DEX data yet, waiting...")
                     continue
                 if token_data.liquidity_usd < 5000:
-                    log.info(f"  POST-GRAD: {symbol} — low liquidity ${token_data.liquidity_usd:,.0f}, waiting...")
+                    self._post_grad_note(mint, f"  POST-GRAD: {symbol} — low liquidity, waiting...")
                     continue
 
                 # A fresh graduate has a pool that is minutes old. An old pool
@@ -1624,7 +1625,7 @@ class MemeBot:
                 # a calm market. Wait for real trading before judging entry.
                 txns_5m = token_data.buys_5m + token_data.sells_5m
                 if txns_5m < self.cfg.grad_min_txns_5m:
-                    log.info(f"  POST-GRAD: {symbol} — only {txns_5m} trades in 5m, waiting...")
+                    self._post_grad_note(mint, f"  POST-GRAD: {symbol} — too few trades in 5m, waiting...")
                     continue
 
                 # Prefer post-dump entries: tokens with negative/low 5m%
@@ -2053,6 +2054,44 @@ class MemeBot:
         if self.cfg.use_jito and not emergency:
             fixed += self.cfg.jito_tip_sol
         return fixed, self.cfg.paper_fee_pct
+
+    async def _paper_sell_quote(self, mint: str, pos, sell_tokens: float):
+        """What a paper sell of `sell_tokens` would return, before costs.
+
+        Returns (sol, price_usd, source) or None when there is no price.
+
+        A token still on the bonding curve is priced from the curve itself,
+        read fresh: selling into it returns vs * T / (vt + T), and never more
+        than the real SOL the curve holds. A market-data quote can be many
+        seconds old, and after a rug it still shows the pre-rug price.
+        """
+        if not pos.graduated:
+            try:
+                cache = getattr(self.onchain, "_curve_cache", None)
+                if isinstance(cache, dict):
+                    cache.pop(mint, None)        # force a fresh read
+                state = await self.onchain.get_bonding_curve_state(mint)
+            except Exception:
+                state = None
+            if state and not state.complete and state.virtual_tokens > 0:
+                raw = sell_tokens * 1e6
+                sol = state.virtual_sol * raw / (state.virtual_tokens + raw)
+                sol = min(sol, max(state.real_sol, 0.0))
+                sol_price = await self.market.get_sol_price()
+                price_usd = (state.virtual_sol / (state.virtual_tokens / 1e6)) * sol_price
+                return sol, price_usd, "bonding curve"
+        token_data = await self.market.get_token(mint)
+        if token_data:
+            return sell_tokens * token_data.price_sol, token_data.price_usd, "market data"
+        return None
+
+    def _post_grad_note(self, mint: str, text: str):
+        """Log a post-graduation wait reason once, not on every poll."""
+        if self._post_grad_logged.get(mint) != text:
+            if len(self._post_grad_logged) > 500:
+                self._post_grad_logged.clear()
+            self._post_grad_logged[mint] = text
+            log.info(text)
 
     def _log_fee_overhead(self):
         """Say up front how much of each position the fixed fees eat."""
@@ -2561,10 +2600,10 @@ class MemeBot:
         log.info(f"  Selling {sell_pct}% of {pos.symbol} ({reason})")
 
         if self.cfg.paper_trading:
-            token_data = await self.market.get_token(mint)
-            if token_data:
-                sell_tokens = pos.tokens * (sell_pct / 100)
-                sol_received_raw = sell_tokens * token_data.price_sol
+            sell_tokens = pos.tokens * (sell_pct / 100)
+            quote = await self._paper_sell_quote(mint, pos, sell_tokens)
+            if quote:
+                sol_received_raw, quote_price_usd, quote_source = quote
                 slippage = self.cfg.paper_slippage_pct
                 if "stop_loss" in reason or "rug" in reason.lower():
                     slippage *= 2  # emergency exits get worse execution
@@ -2577,9 +2616,10 @@ class MemeBot:
                     - fixed, 0.0)
                 log.info(f"  Paper costs: {slippage:.1f}% slippage + {fee_pct:g}% fees + "
                          f"{fixed:.4f} SOL fixed "
-                         f"({sol_received_raw:.4f} → {sol_received:.4f} SOL)")
+                         f"({sol_received_raw:.4f} → {sol_received:.4f} SOL, "
+                         f"priced from {quote_source})")
                 pnl = self.wallet.sell(mint, sell_tokens, sol_received,
-                                        token_data.price_usd)
+                                        quote_price_usd)
                 if is_partial:
                     self.risk.partial_close(mint, sol_received=sol_received,
                                             reason=reason)
