@@ -405,10 +405,23 @@ class PumpPortal:
         await self.http.aclose()
 
 
+# The websockets library logs the handshake request line at DEBUG, and with
+# a keyed connection that line contains the API key. Never let it through.
+for _name in ("websockets", "websockets.client"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
+
 class PumpPortalStream:
     """WebSocket stream for real-time Pump.fun events with reconnect resilience."""
 
-    def __init__(self):
+    def __init__(self, api_key: str = ""):
+        # PumpPortal only serves subscribeTokenTrade / subscribeAccountTrade
+        # to connections that carry a funded API key. Without it the server
+        # answers with a notice and sends no trade events at all.
+        self.api_key = api_key
+        self._key_disabled = False         # keyed connection failed; fell back
+        self.trade_feed_rejected = False   # server refused the trade subscriptions
+        self.trade_events = 0              # trade events received
         self.ws = None
         self._handlers: dict[str, list] = {
             "new_token": [], "token_trade": [], "account_trade": [],
@@ -430,10 +443,14 @@ class PumpPortalStream:
             self._watched_tokens.update(watch_tokens)
 
         attempt = 0
+        keyed_failures = 0
         while True:
+            connected = False
             try:
-                async with websockets.connect(PUMPPORTAL_WS_URL) as ws:
+                async with websockets.connect(self._url()) as ws:
                     self.ws = ws
+                    connected = True
+                    keyed_failures = 0
                     reconnected = attempt > 0
                     attempt = 0
                     log.info("  PumpPortal WS connected")
@@ -470,15 +487,54 @@ class PumpPortalStream:
             except (websockets.ConnectionClosed, ConnectionError) as e:
                 attempt += 1
                 delay = min(3 * (2 ** attempt), 60) + random.uniform(0, 2)
-                log.warning(f"WS disconnected: {e}, reconnecting in {delay:.1f}s (attempt {attempt})...")
+                log.warning(f"WS disconnected: {self._redact(e)}, reconnecting in {delay:.1f}s (attempt {attempt})...")
                 await asyncio.sleep(delay)
             except Exception as e:
                 attempt += 1
                 delay = min(3 * (2 ** attempt), 60) + random.uniform(0, 2)
-                log.error(f"WS error: {e}, reconnecting in {delay:.1f}s (attempt {attempt})...")
+                # A connection that is refused outright while carrying the
+                # key must not take the free new-token feed down with it.
+                if not connected and self.api_key and not self._key_disabled:
+                    keyed_failures += 1
+                    if keyed_failures >= 2:
+                        self._key_disabled = True
+                        self.trade_feed_rejected = True
+                        log.warning("  PumpPortal would not accept the connection with "
+                                    "the API key — reconnecting without it "
+                                    "(no trade events)")
+                log.error(f"WS error: {self._redact(e)}, reconnecting in {delay:.1f}s (attempt {attempt})...")
                 await asyncio.sleep(delay)
 
+    def _url(self) -> str:
+        if self.api_key and not self._key_disabled:
+            return f"{PUMPPORTAL_WS_URL}?api-key={self.api_key}"
+        return PUMPPORTAL_WS_URL
+
+    def _redact(self, text) -> str:
+        text = str(text)
+        return text.replace(self.api_key, "***") if self.api_key else text
+
+    def _server_notice(self, message: str):
+        """Handle a plain {"message": ...} reply from the server."""
+        if "only available" in message or "API key" in message:
+            if not self.trade_feed_rejected:
+                self.trade_feed_rejected = True
+                log.warning(
+                    "  PumpPortal refused the trade subscriptions: "
+                    f"{self._redact(message)[:200]} "
+                    "— no token-trade or wallet-trade events will arrive. "
+                    "Copy-trade then relies on RPC polling only, and creator-sell "
+                    "rug detection, buyer-uniqueness checks and wallet discovery "
+                    "get no data.")
+        else:
+            log.debug(f"  PumpPortal: {self._redact(message)[:200]}")
+
     async def _dispatch(self, data: dict):
+        if isinstance(data, dict) and isinstance(data.get("message"), str) \
+                and "traderPublicKey" not in data and "initialBuy" not in data:
+            self._server_notice(data["message"])
+            return
+
         if "initialBuy" in data:
             for h in self._handlers["new_token"]:
                 try:
@@ -489,6 +545,7 @@ class PumpPortalStream:
             return
 
         if "traderPublicKey" in data:
+            self.trade_events += 1
             for h in self._handlers["token_trade"]:
                 try:
                     if asyncio.iscoroutinefunction(h): await h(data)

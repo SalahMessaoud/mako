@@ -178,12 +178,14 @@ class RiskManager:
         self.persist(pos)
         log.info(f"  Entry price set late for {pos.symbol}: ${price_usd:.10f}")
 
-    def mark_graduated(self, mint: str):
+    def mark_graduated(self, mint: str, grace: bool = True):
+        """`grace=False`: the token was already graduated when we noticed, so
+        no migration is in progress and the stop-loss must stay armed."""
         pos = self.positions.get(mint)
         if not pos or pos.graduated:
             return
         pos.graduated = True
-        if not pos.graduated_at:
+        if grace and not pos.graduated_at:
             pos.graduated_at = time.time()
         self.persist(pos)
 
@@ -236,12 +238,12 @@ class RiskManager:
                   strategy: str = "", wallet: str = "",
                   reserved_sol: float = 0.0) -> float:
         """
-        Dynamic position sizing based on:
-        - Available balance
-        - Signal confidence (0-1)
-        - Strategy recent performance
-        - Loss streak (reduce size after losses)
-        - Wallet score (for copy trades)
+        Position size, never above the strategy's cap.
+
+        The cap (and 15% of balance, and the remaining portfolio room) is the
+        ceiling. Confidence, recent strategy performance, loss streaks and
+        the copied wallet's score can only REDUCE the size below it; a
+        multiplier above 1 just offsets another one below 1.
         """
         total = sum(p.sol_invested for p in self.positions.values()) + reserved_sol
         remaining = self.cfg.max_portfolio_sol - total
@@ -298,7 +300,11 @@ class RiskManager:
              strategy: str, auto_sell_sec: int = 0,
              tx_signature: str = "", creator: str = "",
              graduated: bool = False,
-             buy_unverified: bool = False) -> Position:
+             buy_unverified: bool = False,
+             graduation_grace: bool = False) -> Position:
+        """`graduation_grace` starts the 5-minute post-migration grace (stop
+        suppressed). It is for positions that were HELD through graduation;
+        a token bought after it graduated has no migration dip to ride out."""
         if mint in self.positions:
             return self.positions[mint]
         now = time.time()
@@ -310,7 +316,8 @@ class RiskManager:
             auto_sell_at=(now + auto_sell_sec) if auto_sell_sec > 0 else 0,
             tx_signature=tx_signature, creator=creator,
             original_sol_invested=sol,
-            graduated=graduated, graduated_at=now if graduated else 0.0,
+            graduated=graduated,
+            graduated_at=now if (graduated and graduation_grace) else 0.0,
             buy_unverified=buy_unverified,
         )
         self.positions[mint] = pos
@@ -445,7 +452,7 @@ class RiskManager:
         # Only catastrophic override active during this window.
         in_nostop_window = pos.age_sec < self.cfg.nostop_window_sec
         if in_nostop_window:
-            stop = stop * self.cfg.nostop_multiplier
+            stop = self.cfg.early_stop_pct(stop)
 
         # Curve-aware stop-loss: if curve is >60% and still rising toward
         # graduation, suppress the price-based stop-loss. The token is
@@ -462,8 +469,8 @@ class RiskManager:
         grad_grace = pos.in_graduation_grace
 
         if curve_protected or grad_grace:
-            # Only exit on catastrophic dumps
-            if pnl <= -80:
+            # Only exit on large dumps
+            if pnl <= -self.cfg.protected_stop_pct:
                 return "stop_loss", 100
             if curve_protected:
                 curve_drop = pos.curve_pct_prev - pos.curve_pct

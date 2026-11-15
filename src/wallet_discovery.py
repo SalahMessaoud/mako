@@ -22,7 +22,7 @@ class WalletDiscovery:
     def __init__(self, db: Database, manual_wallets: list[str],
                  max_auto: int = 10, min_score: float = 50.0,
                  min_buys: int = 2, min_sells: int = 1,
-                 min_ratio: float = 1.15):
+                 min_ratio: float = 1.15, min_tokens: int = 3):
         self.db = db
         self.manual_wallets: set[str] = set(manual_wallets)
         self.max_auto = max_auto
@@ -30,12 +30,17 @@ class WalletDiscovery:
         self.min_buys = min_buys
         self.min_sells = min_sells
         self.min_ratio = min_ratio
+        self.min_tokens = min_tokens
+        # Wallets seen creating a token. A creator selling into its own
+        # buyers looks exactly like a profitable trader, so never promote one.
+        self._creators: set[str] = set()
 
         # Load persisted auto wallets from DB
         saved = db.get_state("auto_wallets", [])
         self.auto_wallets: set[str] = set(saved) if saved else set()
 
-        # Candidate tracking: wallet -> {buys, sells, sol_bought, sol_sold, first_seen}
+        # Candidate tracking: wallet -> {buys, sells, sol_bought, sol_sold,
+        # first_seen, mints: {mint: [sol_bought, sol_sold, complete]}}
         self._candidates: dict[str, dict] = {}
 
         if self.auto_wallets:
@@ -46,23 +51,40 @@ class WalletDiscovery:
         """All wallets to watch (manual + auto)."""
         return list(self.manual_wallets | self.auto_wallets)
 
+    MAX_CREATORS = 20000
+
+    def note_creator(self, wallet: str):
+        """Mark a wallet as a token creator (never promoted)."""
+        if not wallet:
+            return
+        if len(self._creators) >= self.MAX_CREATORS:
+            self._creators.clear()
+        self._creators.add(wallet)
+        self._candidates.pop(wallet, None)
+
     def observe_trade(self, event: dict):
         """
         Called on all token trade events to track candidate wallets.
-        Observes buy/sell patterns to identify potentially profitable wallets.
+
+        Trades are tracked per token. We only see a token's trades while we
+        are subscribed to it, so a wallet whose FIRST visible trade on a
+        token is a sell bought before we were watching: that token is
+        marked incomplete and never counts as a profit.
         """
         trader = event.get("traderPublicKey", "")
         if not trader:
             return
 
-        # Don't track wallets we already watch
-        if trader in self.manual_wallets or trader in self.auto_wallets:
+        # Don't track wallets we already watch, or token creators
+        if (trader in self.manual_wallets or trader in self.auto_wallets
+                or trader in self._creators):
             return
 
         tx_type = event.get("txType", "")
+        mint = event.get("mint", "")
         sol_amount = float(event.get("solAmount", 0) or 0)
 
-        if sol_amount < 0.01:
+        if sol_amount < 0.01 or tx_type not in ("buy", "sell") or not mint:
             return
 
         if trader not in self._candidates:
@@ -72,16 +94,29 @@ class WalletDiscovery:
             self._candidates[trader] = {
                 "buys": 0, "sells": 0,
                 "sol_bought": 0.0, "sol_sold": 0.0,
-                "first_seen": time.time(),
+                "first_seen": time.time(), "mints": {},
             }
 
         c = self._candidates[trader]
+        per_mint = c["mints"].get(mint)
+        if per_mint is None:
+            if len(c["mints"]) >= 50:
+                return
+            # [sol_bought, sol_sold, complete view]
+            per_mint = c["mints"][mint] = [0.0, 0.0, tx_type == "buy"]
         if tx_type == "buy":
             c["buys"] += 1
             c["sol_bought"] += sol_amount
-        elif tx_type == "sell":
+            per_mint[0] += sol_amount
+        else:
             c["sells"] += 1
             c["sol_sold"] += sol_amount
+            per_mint[1] += sol_amount
+
+    def _round_trips(self, c: dict) -> list[tuple[float, float]]:
+        """(bought, sold) for each token where we saw the buy AND a sell."""
+        return [(b, s) for b, s, complete in c.get("mints", {}).values()
+                if complete and b > 0 and s > 0]
 
     def check_promotions(self) -> list[str]:
         """
@@ -89,7 +124,10 @@ class WalletDiscovery:
 
         Promotion criteria:
         - DB wallet score >= min_score, win rate >= 55%, 5+ trades
-        - OR candidate tracking shows sells > 1.3x buys
+        - OR an observed candidate with complete round trips (buy and sell
+          both seen) on min_tokens different tokens, most of them profitable,
+          selling min_ratio times what it bought across them. Token creators
+          are excluded.
 
         Demotion: auto wallets with score < 30 and 10+ trades.
 
@@ -147,18 +185,28 @@ class WalletDiscovery:
             if len(self.auto_wallets) >= self.max_auto:
                 break
 
+            if wallet in self._creators:
+                continue
+
             # Need enough data
             if c["buys"] < self.min_buys or c["sells"] < self.min_sells:
                 continue
+            trips = self._round_trips(c)
+            if len(trips) < self.min_tokens:
+                continue
+            bought = sum(b for b, _ in trips)
+            sold = sum(s for _, s in trips)
+            wins = sum(1 for b, s in trips if s > b)
+            if wins * 2 <= len(trips):
+                continue   # profitable on half or fewer of its tokens
 
-            # Check if selling significantly more than buying
-            if c["sol_bought"] > 0 and c["sol_sold"] / c["sol_bought"] >= self.min_ratio:
+            if bought > 0 and sold / bought >= self.min_ratio:
                 self.auto_wallets.add(wallet)
                 newly_promoted.append(wallet)
                 self._candidates.pop(wallet, None)
-                ratio = c["sol_sold"] / c["sol_bought"]
                 log.info(f"  WALLET PROMOTED (candidate): {wallet[:12]}... "
-                         f"(ratio={ratio:.2f}x, buys={c['buys']}, sells={c['sells']})")
+                         f"(ratio={sold / bought:.2f}x over {len(trips)} tokens, "
+                         f"{wins} profitable)")
 
         # 3. Demote underperforming auto wallets
         for wallet in list(self.auto_wallets):
@@ -172,19 +220,6 @@ class WalletDiscovery:
         self.db.set_state("auto_wallets", list(self.auto_wallets))
 
         return newly_promoted
-
-    def score_pipeline_outcome(self, creator: str, mint: str, passed: bool,
-                               confidence: float = 0.0):
-        """Score a creator based on whether their token passed the pipeline.
-
-        Pipeline passes are scored conservatively to avoid inflating
-        creator scores — only real closed trades should drive promotion.
-        """
-        if not creator:
-            return
-        # Use tiny scores so pipeline outcomes inform but don't dominate
-        pnl_equiv = 0.01 if passed else -0.005
-        self.db.update_wallet_score(creator, pnl_equiv, 0, mint, passed)
 
     def get_stats(self) -> dict:
         """Get discovery statistics for reporting."""

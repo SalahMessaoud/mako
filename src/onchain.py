@@ -258,8 +258,13 @@ class OnChainAnalyzer:
             log.debug(f"is_graduated check error for {mint[:8]}: {e}")
             return None
 
+    # Signatures fetched per count. The count saturates at this value, so it
+    # must be well above the thresholds it is compared with.
+    TX_COUNT_LIMIT = 300
+
     async def get_recent_tx_count(self, mint: str, seconds: int = 300) -> int:
-        """Count recent transactions on a token's bonding curve PDA."""
+        """Count transactions on a token's bonding curve PDA in the last
+        `seconds` (saturates at TX_COUNT_LIMIT)."""
         try:
             from solders.pubkey import Pubkey
             mint_pk = Pubkey.from_string(mint)
@@ -268,12 +273,12 @@ class OnChainAnalyzer:
                 [PUMP_BONDING_SEED, bytes(mint_pk)], pump_pk
             )
             result = await self._rpc_call("getSignaturesForAddress", [
-                str(pda), {"limit": 50, "commitment": "confirmed"}
+                str(pda), {"limit": self.TX_COUNT_LIMIT, "commitment": "confirmed"}
             ])
             if not result:
                 return 0
             cutoff = time.time() - seconds
-            return sum(1 for s in result if s.get("blockTime", 0) > cutoff)
+            return sum(1 for s in result if (s.get("blockTime") or 0) > cutoff)
         except Exception as e:
             log.debug(f"get_recent_tx_count error for {mint[:8]}: {e}")
             return 0

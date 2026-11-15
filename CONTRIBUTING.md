@@ -26,8 +26,9 @@ All source code lives in `src/`. See the [Architecture section](README.md#6-arch
 
 1. Create a branch: `git checkout -b feature/your-feature`
 2. Make your changes in `src/`
-3. Test in paper mode before submitting
-4. Verify syntax: `python -c "import ast; ast.parse(open('your_file.py').read())"`
+3. Run the tests: `cd tests && python -m unittest`
+4. Add a test for any change to trade execution, exits, or strategy logic. The suite is stdlib `unittest`; `tests/helpers.py` provides fakes for the wallet, RPC, PumpPortal and Jupiter, blocks network access and never loads `.env`
+5. Test in paper mode before submitting, with a scratch database (`--db /tmp/test.db`)
 
 ## Pull Requests
 
@@ -38,7 +39,7 @@ All source code lives in `src/`. See the [Architecture section](README.md#6-arch
 
 ## Areas Where Help is Needed
 
-- **Testing**: There is no test suite yet. Adding unit tests for any module would be valuable.
+- **Testing**: `tests/` covers the trade lifecycle, exits, the strategy pipeline and wallet discovery with a faked network. The live PumpPortal Lightning and Jupiter paths have never been tested against the real services; `status.py`, `monitor.py` and `telegram_ui.py` have no tests.
 - **Backtesting**: A replay mode that processes historical data would help validate strategies.
 - **New strategies**: The strategy interface is simple -- implement `evaluate()` and return a `Signal`.
 - **Exchange support**: Currently pump.fun only. Raydium/Orca integration would expand coverage.

@@ -63,11 +63,21 @@ class Config:
 
     # PumpPortal
     pumpportal_api_key: str = ""
+    # Connect the WebSocket with the API key to receive token / wallet trade
+    # events. PumpPortal BILLS these to the key's wallet (per event), in
+    # paper mode too, so it is off unless asked for.
+    pumpportal_trade_feed: bool = False
 
     # Mode
     paper_trading: bool = True
     paper_balance_sol: float = 2.0
     paper_slippage_pct: float = 3.0
+    # Paper-mode cost model. The percentages are ASSUMPTIONS (pump.fun fee
+    # plus PumpPortal fee per side; Jupiter network fee), not measurements.
+    paper_fee_pct: float = 1.5
+    paper_jupiter_fee_sol: float = 0.0005
+    # Cap the priority fee at this % of the trade's SOL size (0 = no cap).
+    max_fee_pct_of_trade: float = 5.0
     strategy: str = "multi"
     notify_only: bool = False  # Run pipeline but don't execute trades, just notify
 
@@ -92,6 +102,8 @@ class Config:
     fast_stop_grace_sec: int = 180
     nostop_window_sec: int = 180
     nostop_multiplier: float = 4.0
+    nostop_max_stop_pct: float = 40.0   # the widened early stop never exceeds this
+    protected_stop_pct: float = 50.0    # stop while curve-protected / in graduation grace
     ws_stop_loss_enabled: bool = False
     stop_loss_pct: float = 10.0
     momentum_stop_loss_pct: float = 12.0
@@ -140,6 +152,8 @@ class Config:
     # Graduation
     grad_min_curve_pct: float = 75
     grad_buy_at_pct: float = 88
+    grad_max_pool_age_min: float = 30.0   # post-graduation buys need a pool this young
+    grad_min_txns_5m: int = 5             # ...and real 5-minute trade data
 
     # Wallet discovery
     auto_discover_wallets: bool = True
@@ -148,6 +162,7 @@ class Config:
     wallet_discovery_min_buys: int = 2
     wallet_discovery_min_sells: int = 1
     wallet_discovery_min_ratio: float = 1.15
+    wallet_discovery_min_tokens: int = 3   # round trips on this many different tokens
 
     # Rug detection
     rug_detection: bool = True
@@ -187,9 +202,13 @@ class Config:
             fallback_rpc_url=os.getenv("FALLBACK_RPC_URL", ""),
             private_key=os.getenv("WALLET_PRIVATE_KEY", ""),
             pumpportal_api_key=os.getenv("PUMPPORTAL_API_KEY", ""),
+            pumpportal_trade_feed=os.getenv("PUMPPORTAL_TRADE_FEED", "false").lower() == "true",
             paper_trading=(mode != "live"),
             paper_balance_sol=_safe_float("PAPER_BALANCE_SOL", "2.0"),
             paper_slippage_pct=_safe_float("PAPER_SLIPPAGE_PCT", "3.0"),
+            paper_fee_pct=_safe_float("PAPER_FEE_PCT", "1.5"),
+            paper_jupiter_fee_sol=_safe_float("PAPER_JUPITER_FEE_SOL", "0.0005"),
+            max_fee_pct_of_trade=_safe_float("MAX_FEE_PCT_OF_TRADE", "5"),
             strategy=os.getenv("STRATEGY", "multi"),
             notify_only=os.getenv("NOTIFY_ONLY", "false").lower() == "true",
             max_buy_sol=_safe_float("MAX_BUY_SOL", "0.05"),
@@ -208,6 +227,11 @@ class Config:
             fast_stop_grace_sec=_safe_int("FAST_STOP_GRACE_SEC", "180"),
             nostop_window_sec=_safe_int("NOSTOP_WINDOW_SEC", "180"),
             nostop_multiplier=_safe_float("NOSTOP_MULTIPLIER", "4"),
+            nostop_max_stop_pct=_safe_float("NOSTOP_MAX_STOP_PCT", "40"),
+            protected_stop_pct=_safe_float("PROTECTED_STOP_PCT", "50"),
+            grad_max_pool_age_min=_safe_float("GRAD_MAX_POOL_AGE_MIN", "30"),
+            grad_min_txns_5m=_safe_int("GRAD_MIN_TXNS_5M", "5"),
+            wallet_discovery_min_tokens=_safe_int("WALLET_DISCOVERY_MIN_TOKENS", "3"),
             ws_stop_loss_enabled=os.getenv("WS_STOP_LOSS_ENABLED", "false").lower() == "true",
             stop_loss_pct=_safe_float("STOP_LOSS_PCT", "10"),
             momentum_stop_loss_pct=_safe_float("MOMENTUM_STOP_LOSS_PCT", "12"),
@@ -262,6 +286,28 @@ class Config:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         )
+
+    def early_stop_pct(self, stop: float) -> float:
+        """Stop-loss used during the no-stop window: widened, but capped."""
+        return min(stop * self.nostop_multiplier,
+                   max(self.nostop_max_stop_pct, stop))
+
+    def priority_fee_for(self, trade_sol: float, emergency: bool = False) -> float:
+        """Priority fee for a pump.fun trade of `trade_sol`.
+
+        PRIORITY_FEE_SOL is a fixed amount, so on a small position it can be
+        a large share of the trade. MAX_FEE_PCT_OF_TRADE caps it relative to
+        the trade size. Emergency sells pay double, up to 0.01 SOL.
+        """
+        fee = self.priority_fee_sol
+        if emergency:
+            fee = min(fee * 2, 0.01)
+        if self.max_fee_pct_of_trade > 0 and trade_sol > 0:
+            cap = trade_sol * self.max_fee_pct_of_trade / 100
+            if emergency:
+                cap *= 2
+            fee = min(fee, cap)
+        return max(fee, 0.0)
 
     def validate(self) -> list[str]:
         issues = []

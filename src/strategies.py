@@ -1,4 +1,6 @@
-"""Trading strategies — sniper, momentum, copy trading (with sell mirroring), graduation."""
+"""Trading strategies — sniper, copy trading (with sell mirroring), graduation.
+
+Momentum lives in bot.py (the on-chain discovery pipeline)."""
 
 import time
 import logging
@@ -123,87 +125,6 @@ class SniperStrategy:
         """Called when a sniper position rugs — prevents sniping future tokens from this creator."""
         if creator:
             self.blacklist_creators.add(creator)
-
-
-class MomentumStrategy:
-    """Buy tokens with strong short-term momentum (DexScreener data)."""
-
-    def __init__(self, market: MarketData, db: Database = None):
-        self.market = market
-        self.db = db
-        self.seen: set[str] = set()
-        self.cooldown: dict[str, float] = {}
-
-    async def scan(self) -> list[Signal]:
-        signals = []
-        trending = await self.market.get_trending(min_liq=10_000, limit=25)
-        return self.scan_tokens(trending)
-
-    def scan_tokens(self, tokens: list) -> list[Signal]:
-        """Evaluate a list of TokenData objects for momentum signals."""
-        signals = []
-
-        # Clean up expired cooldowns and stale seen entries
-        now = time.time()
-        expired = [m for m, t in self.cooldown.items() if now - t > 300]
-        for m in expired:
-            self.cooldown.pop(m, None)
-            self.seen.discard(m)
-
-        for token in tokens:
-            if token.mint in self.seen:
-                if time.time() - self.cooldown.get(token.mint, 0) < 300:
-                    continue
-            # Skip blacklisted
-            if self.db and self.db.is_blacklisted(token.mint):
-                continue
-
-            signal = self._evaluate(token)
-            if signal:
-                signals.append(signal)
-                self.cooldown[token.mint] = time.time()
-
-        signals.sort(key=lambda s: s.confidence, reverse=True)
-        return signals[:5]
-
-    def _evaluate(self, t: TokenData) -> Signal | None:
-        score = 0.0
-        reasons = []
-
-        # Young tokens (<15 min) have noisy 5m data — lower volume bar,
-        # require stronger price action to compensate
-        is_young = t.age_minutes < 15
-        min_vol = 2_000 if is_young else 5_000
-        min_price_change = 5 if is_young else 3
-
-        if t.price_change_5m > 50: return None
-        if t.price_change_5m >= 15: score += 0.3; reasons.append(f"5m: +{t.price_change_5m:.1f}%")
-        elif t.price_change_5m >= 8: score += 0.2; reasons.append(f"5m: +{t.price_change_5m:.1f}%")
-        elif t.price_change_5m >= min_price_change: score += 0.1; reasons.append(f"5m: +{t.price_change_5m:.1f}%")
-        else: return None
-
-        if t.volume_5m >= 20_000: score += 0.2; reasons.append(f"Vol: ${t.volume_5m:,.0f}")
-        elif t.volume_5m >= min_vol: score += 0.1; reasons.append(f"Vol: ${t.volume_5m:,.0f}")
-        else: return None
-
-        br = t.buy_ratio_5m
-        if br >= 0.6: score += 0.2; reasons.append(f"Buy: {br:.0%}")
-        elif br >= 0.55: score += 0.1
-        else: return None
-
-        if t.price_change_1h > 5: score += 0.1; reasons.append(f"1h: +{t.price_change_1h:.1f}%")
-        if not t.is_active or t.liquidity_usd < 10_000: return None
-
-        if is_young:
-            reasons.append(f"Age: {t.age_minutes:.0f}m")
-
-        confidence = min(score, 1.0)
-        if confidence >= 0.35:
-            self.seen.add(t.mint)
-            return Signal(mint=t.mint, symbol=t.symbol, strategy="momentum",
-                          confidence=confidence, reason=" | ".join(reasons),
-                          token_data=t)
-        return None
 
 
 class CopyTradeStrategy:
@@ -386,10 +307,38 @@ class GraduationStrategy:
         self.watching: dict[str, float] = {}  # mint -> curve_pct
         self._watching_times: dict[str, float] = {}  # mint -> last_seen_time
         self.bought: set[str] = set()
+        # Mints we have read on-chain while still below 100%
+        self._seen_below: set[str] = set()
         # Post-graduation tracking: mint -> graduation detected time
         self._graduated_at: dict[str, float] = {}
         # Tokens ready for post-graduation buy (passed wait period)
         self._ready_to_buy: dict[str, dict] = {}  # mint -> event data
+
+    # pump.fun bonding curve: ~30 virtual SOL at launch, graduates at ~85 real SOL
+    VIRTUAL_SOL_AT_LAUNCH = 30.0
+    GRADUATION_SOL = 85.0
+    MAX_TRACKED = 2000
+
+    def note_curve(self, mint: str, curve_pct: float):
+        """Record an ON-CHAIN curve reading for a token.
+
+        A graduation is only believed for a token we have ourselves seen
+        still on the curve. Without this, any event for a token that
+        graduated months ago reads as "just graduated".
+        """
+        if 0 < curve_pct < 100:
+            if len(self._seen_below) >= self.MAX_TRACKED:
+                self._seen_below.clear()
+            self._seen_below.add(mint)
+
+    def _estimate_pct(self, event: dict) -> float | None:
+        """Rough curve % from an event's virtual SOL, or None if absent.
+        Only ever used to SKIP an RPC call, never to declare anything."""
+        vsol = float(event.get("vSolInBondingCurve", 0) or 0)
+        if vsol <= 0:
+            return None
+        real = max(vsol - self.VIRTUAL_SOL_AT_LAUNCH, 0)
+        return min(real / self.GRADUATION_SOL * 100, 100)
 
     async def evaluate_trade(self, event: dict) -> Signal | None:
         """Track tokens approaching graduation. Does NOT emit buy signals directly."""
@@ -398,26 +347,27 @@ class GraduationStrategy:
             return None
         if self.db and self.db.is_blacklisted(mint):
             return None
+        if not self.onchain:
+            return None
 
-        # Try on-chain reader first (exact), fallback to event data
-        curve_pct = 0
-        if self.onchain:
-            try:
-                curve_pct = await self.onchain.get_bonding_curve_pct(mint)
-            except Exception:
-                pass
+        # Most events are for tokens nowhere near graduation: don't spend an
+        # RPC call on those.
+        estimate = self._estimate_pct(event)
+        if (estimate is not None and estimate < self.min_curve - 20
+                and mint not in self.watching):
+            return None
 
-        # Fallback: estimate from event data
+        try:
+            curve_pct = await self.onchain.get_bonding_curve_pct(mint)
+        except Exception:
+            return None
         if curve_pct <= 0:
-            vsol = float(event.get("vSolInBondingCurve", 0) or 0)
-            if vsol <= 0:
-                return None
-            curve_pct = min((vsol / 85.0) * 100, 100)
+            return None   # unreadable: an estimate is not evidence
 
+        self.note_curve(mint, curve_pct)
         if curve_pct < self.min_curve:
             return None
 
-        last_pct = self.watching.get(mint, 0)
         self.watching[mint] = curve_pct
         self._watching_times[mint] = time.time()
 
@@ -429,9 +379,15 @@ class GraduationStrategy:
                 self.watching.pop(m, None)
                 self._watching_times.pop(m, None)
                 self.bought.discard(m)
+                self._seen_below.discard(m)
 
-        # Detect graduation event (curve hits 100% / complete)
+        # Detect graduation: the curve is complete AND we watched it get there
         if curve_pct >= 100 and mint not in self._graduated_at:
+            if mint not in self._seen_below:
+                # Already graduated before we ever saw it — not a fresh one.
+                self.watching.pop(mint, None)
+                self._watching_times.pop(mint, None)
+                return None
             symbol = event.get("symbol", mint[:8])
             creator = event.get("traderPublicKey", "")
             self._graduated_at[mint] = time.time()

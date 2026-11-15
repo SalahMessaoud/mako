@@ -17,7 +17,7 @@ from onchain import OnChainAnalyzer
 from safety import SafetyChecker
 from risk_manager import RiskManager
 from strategies import (
-    SniperStrategy, MomentumStrategy,
+    SniperStrategy,
     CopyTradeStrategy, GraduationStrategy, Signal, SellSignal,
 )
 from notifications import Notifier
@@ -120,8 +120,15 @@ class MintPool:
             self._total_buy_sol.pop(m, None)
             self._total_trades.pop(m, None)
 
-    def get_best_candidates(self, count: int = 30, min_age: int = 120) -> list[str]:
-        """Score and rank candidates for on-chain activity check."""
+    def get_best_candidates(self, count: int = 30, min_age: int = 120,
+                            prefer_young: bool = False) -> list[str]:
+        """Score and rank candidates for an on-chain check.
+
+        `prefer_young=True` is for the momentum pipeline, whose scorer
+        rewards 2-6 minute tokens and penalises anything past 8: ranking by
+        the 5-12 minute window would feed it tokens it then marks down.
+        The graduation poll wants the older ones and keeps the default.
+        """
         now = time.time()
         scored = []
         for m, c in self.candidates.items():
@@ -131,8 +138,22 @@ class MintPool:
 
             score = 0.0
 
+            if prefer_young:
+                if age <= 360:
+                    score += 3.0
+                elif age <= 480:
+                    score += 2.0
+                elif age <= 600:
+                    score += 1.0
+                # Live activity seen on the WebSocket, so a token that
+                # launched quietly but is moving now is not ranked out.
+                trades = self._total_trades.get(m, 0)
+                if trades >= 30:
+                    score += 2.0
+                elif trades >= 10:
+                    score += 1.0
             # Age sweet spot: 5-12 min (most likely to have DexScreener data + still early)
-            if 300 <= age <= 720:
+            elif 300 <= age <= 720:
                 score += 3.0
             elif 180 <= age < 300:
                 score += 1.5
@@ -189,6 +210,8 @@ class MemeBot:
     ZERO_CLOSE_MIN_AGE_SEC = 30       # never trust a zero read sooner after a buy
     RECONCILE_GRACE_SEC = 120         # how long a buy may stay tokenless
     PARTIAL_HOLD_SEC = 90             # blockhash lifetime: an unknown tx can land until then
+    CURVE_OBS_MIN_SEC = 4             # earlier curve reading must be this old...
+    CURVE_OBS_MAX_SEC = 90            # ...and no older than this
     SELL_BALANCE_POLLS = 3            # balance reads after an unconfirmed sell
     SELL_BACKOFF_SEC = 30             # pause between sell attempts after a failure
     SELL_BACKOFF_LONG_SEC = 300       # pause once STUCK_BACKOFF_AFTER attempts failed
@@ -263,7 +286,10 @@ class MemeBot:
             log.info("  Rug detection enabled")
 
         # WebSocket stream
-        self.stream = PumpPortalStream()
+        # The keyed connection is opt-in: PumpPortal bills trade events to
+        # the key's wallet, and that would be real SOL even in paper mode.
+        self.stream = PumpPortalStream(
+            api_key=config.pumpportal_api_key if config.pumpportal_trade_feed else "")
 
         # Strategies
         self.strategies_enabled = self._parse_strategies()
@@ -277,11 +303,17 @@ class MemeBot:
             log.info("  Sniper strategy enabled")
 
         if "momentum" in self.strategies_enabled:
-            self.momentum = MomentumStrategy(self.market, db=self.db)
             log.info("  Momentum strategy enabled")
 
+        self._pipeline_rotation = 0
+        # mint -> (time, virtual SOL) at the previous pipeline evaluation
+        self._curve_obs: dict[str, tuple[float, float]] = {}
         self._copy_event_count = 0  # Diagnostic counter
         self._wallet_seen_sigs: dict[str, set[str]] = {}  # wallet -> seen tx signatures
+        self._wallet_poll_ok = 0
+        self._wallet_poll_fail = 0
+        self._wallet_poll_warned_at = 0.0
+        self._wallet_poll_task = None
 
         if "copy_trade" in self.strategies_enabled and config.copy_wallets:
             self.copy_trade = CopyTradeStrategy(config.copy_wallets, db=self.db)
@@ -316,6 +348,7 @@ class MemeBot:
                 min_buys=config.wallet_discovery_min_buys,
                 min_sells=config.wallet_discovery_min_sells,
                 min_ratio=config.wallet_discovery_min_ratio,
+                min_tokens=config.wallet_discovery_min_tokens,
             )
             log.info(f"  Wallet discovery enabled (max {config.max_auto_wallets} auto wallets)")
 
@@ -453,6 +486,7 @@ class MemeBot:
             await self._reconcile_positions(force=True)
         except Exception as e:
             log.warning(f"  Startup reconcile error: {e}")
+        self._log_fee_overhead()
         tasks.append(asyncio.create_task(self._poll_loop()))
         tasks.append(asyncio.create_task(self._fast_position_check()))
         log.info("  All async tasks launched")
@@ -586,7 +620,7 @@ class MemeBot:
 
                 # RPC wallet polling for copy trade (every ~30s)
                 if tick % 10 == 0 and "copy_trade" in self.strategies_enabled:
-                    await self._poll_wallet_transactions()
+                    self._start_wallet_poll()
 
                 # Wallet discovery promotions (every ~5 min)
                 if tick % 100 == 0 and hasattr(self, 'wallet_discovery'):
@@ -651,7 +685,7 @@ class MemeBot:
                     # window to avoid killing correct signals early.
                     in_nostop_window = pos.age_sec < self.cfg.nostop_window_sec
                     if in_nostop_window:
-                        stop = stop * self.cfg.nostop_multiplier
+                        stop = self.cfg.early_stop_pct(stop)
 
                     danger_threshold = -(stop / 2)
 
@@ -696,11 +730,11 @@ class MemeBot:
                     if (pos.curve_pct > 60 and pos.curve_rising
                             and not pos.graduated
                             and (time.time() - pos.curve_updated_at) < 30
-                            and pnl_pct > -60):
+                            and pnl_pct > -self.cfg.protected_stop_pct):
                         continue
 
                     # Post-graduation grace: don't fast-exit during Raydium migration
-                    if pos.in_graduation_grace and pnl_pct > -80:
+                    if pos.in_graduation_grace and pnl_pct > -self.cfg.protected_stop_pct:
                         continue
 
                     # Check if it's past the full stop-loss (with confirmation)
@@ -736,23 +770,9 @@ class MemeBot:
         # Stage 1: Add to scored mint pool (replaces random _recent_mints)
         self.mint_pool.add(event)
 
-        # Feed wallet discovery: observe token creators as potential candidates
+        # A token's creator must never be promoted as a wallet to copy.
         if hasattr(self, 'wallet_discovery'):
-            creator = event.get("traderPublicKey", "")
-            # Estimate SOL spent from vSolInBondingCurve (starts at ~30 virtual SOL)
-            vsol = float(event.get("vSolInBondingCurve", 0) or 0)
-            sol_spent = max(vsol - 30.0, 0)
-            if creator and sol_spent > 0.001:
-                discovery_event = {
-                    "traderPublicKey": creator,
-                    "txType": "buy",
-                    "solAmount": sol_spent,
-                    "mint": mint,
-                }
-                try:
-                    self.wallet_discovery.observe_trade(discovery_event)
-                except Exception:
-                    pass
+            self.wallet_discovery.note_creator(event.get("traderPublicKey", ""))
 
         # Subscribe promising tokens to trade events for buyer uniqueness tracking.
         # Only subscribe tokens with decent dev buy (>= 0.1 SOL) to limit WS load.
@@ -913,12 +933,21 @@ class MemeBot:
         signals = []
 
         # ── Stage 1: Get top candidates from scored MintPool ─────
-        top_candidates = self.mint_pool.get_best_candidates(count=20, min_age=90)
+        top_candidates = self.mint_pool.get_best_candidates(
+            count=20, min_age=90, prefer_young=True)
 
         if top_candidates:
             # ── Stage 2: On-chain activity filter (individual RPC calls) ───
+            # Ten checks per cycle: the six best-ranked, plus four that
+            # rotate through the rest so lower-ranked tokens still get looked at.
+            head, tail = top_candidates[:6], top_candidates[6:]
+            rotating = []
+            if tail:
+                start = self._pipeline_rotation % len(tail)
+                rotating = (tail[start:] + tail[:start])[:4]
+                self._pipeline_rotation += 4
             active_mints = []
-            for mint in top_candidates[:10]:
+            for mint in head + rotating:
                 try:
                     tx_count = await self.onchain.get_recent_tx_count(mint, seconds=300)
                     # Fallback to WebSocket trade count when RPC fails/returns 0
@@ -1007,6 +1036,12 @@ class MemeBot:
                 continue
 
             evaluated += 1
+            # Keep the stored reading until it is old enough to compare
+            # against; replacing it every cycle would leave nothing to
+            # compare with when cycles run faster than CURVE_OBS_MIN_SEC.
+            prev_obs = self._curve_obs.get(mint)
+            if prev_obs is None or time.time() - prev_obs[0] >= self.CURVE_OBS_MIN_SEC:
+                self._curve_obs[mint] = (time.time(), state.virtual_sol)
 
             # ── Compute momentum signals ─────────────────────
             age_sec = time.time() - cand.time
@@ -1117,7 +1152,9 @@ class MemeBot:
                 reasons.append(f"Curve +{growth_pct:.1f}%")
 
             # ── Transaction density (rate per minute) ──
-            tx_rate = tx_count / max(age_min, 1)
+            # tx_count covers the last 5 minutes at most, so that is the
+            # longest span it can be averaged over.
+            tx_rate = tx_count / min(max(age_min, 1), 5)
             if tx_rate >= 8:
                 score += 0.20
                 reasons.append(f"TxRate: {tx_rate:.1f}/m")
@@ -1179,7 +1216,20 @@ class MemeBot:
             confidence = min(score, 1.0)
 
             if confidence >= self.cfg.min_momentum_confidence:
-                # Two-point curve measurement: confirm growth is sustained
+                # Sustained growth: the curve must be higher than it was at
+                # an earlier pipeline cycle. A token seen for the first time
+                # waits one cycle; "did not fall in 2 seconds" proves nothing.
+                obs_age = (time.time() - prev_obs[0]) if prev_obs else None
+                if obs_age is None or obs_age < self.CURVE_OBS_MIN_SEC \
+                        or obs_age > self.CURVE_OBS_MAX_SEC:
+                    log.info(f"  2PT-WAIT: {cand.symbol} — no earlier reading to "
+                             f"compare with yet")
+                    continue
+                if state.virtual_sol <= prev_obs[1]:
+                    log.info(f"  2PT-FAIL: {cand.symbol} — no growth in {obs_age:.0f}s "
+                             f"({prev_obs[1]:.2f}→{state.virtual_sol:.2f} SOL)")
+                    continue
+                # Then a short recheck so we do not buy into a drop.
                 first_sol = state.virtual_sol
                 await asyncio.sleep(2)
                 state2 = await self.onchain.get_bonding_curve_state(mint)
@@ -1210,10 +1260,6 @@ class MemeBot:
                     raw_event={"marketCapSol": mcap_sol, "mint": mint},
                     creator=cand.creator,
                 ))
-                # Score creator positively for passing pipeline
-                if hasattr(self, 'wallet_discovery'):
-                    self.wallet_discovery.score_pipeline_outcome(
-                        cand.creator, mint, True, confidence)
                 if mint not in self._notified_candidates:
                     self._notified_candidates.add(mint)
                     self.notify.candidate_alert(
@@ -1224,10 +1270,11 @@ class MemeBot:
                     )
             else:
                 skipped_reasons["low_score"] += 1
-                # Score creator negatively for failing pipeline
-                if hasattr(self, 'wallet_discovery'):
-                    self.wallet_discovery.score_pipeline_outcome(
-                        cand.creator, mint, False, confidence)
+
+        # Forget readings for tokens that have left the pool
+        if len(self._curve_obs) > 500:
+            self._curve_obs = {m: o for m, o in self._curve_obs.items()
+                               if m in self.mint_pool.candidates}
 
         if evaluated > 0 and signals:
             log.info(f"  Pipeline Stage 3: {len(signals)}/{evaluated} tokens have momentum")
@@ -1245,27 +1292,49 @@ class MemeBot:
     # RPC WALLET POLLING (catches Raydium/Jupiter trades)
     # ══════════════════════════════════════════════════════════
 
+    WALLET_POLL_MAX_WALLETS = 8       # wallets polled over RPC per cycle
+    WALLET_POLL_SIG_LIMIT = 15        # recent signatures fetched per wallet
+    WALLET_POLL_MAX_NEW = 8           # new transactions parsed per wallet per cycle
+    # Swaps into these are not token buys worth copying
+    COPY_IGNORE_MINTS = frozenset({
+        "So11111111111111111111111111111111111111112",    # wrapped SOL
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
+    })
+
+    def _wallets_to_poll(self) -> list[str]:
+        """Manual wallets first, then auto-discovered ones, in a stable order."""
+        if not hasattr(self, 'copy_trade'):
+            return []
+        watched = self.copy_trade.wallets
+        manual = [w for w in self.cfg.copy_wallets if w in watched]
+        auto = sorted(w for w in watched if w not in set(manual))
+        return (manual + auto)[:self.WALLET_POLL_MAX_WALLETS]
+
+    def _start_wallet_poll(self):
+        """Run the wallet poll in the background: it makes many RPC calls
+        and must not delay position checks in the main loop."""
+        task = getattr(self, "_wallet_poll_task", None)
+        if task and not task.done():
+            return   # previous cycle still running
+        self._wallet_poll_task = asyncio.create_task(self._poll_wallet_transactions())
+
     async def _poll_wallet_transactions(self):
-        """Poll manual copy-trade wallets via RPC to catch non-pump.fun trades.
+        """Poll copy-trade wallets via RPC to catch non-pump.fun trades.
 
         PumpPortal WebSocket only reports bonding curve trades. This poller uses
         getSignaturesForAddress + getTransaction to detect trades on Raydium,
         Jupiter, and other DEXes that the WebSocket misses.
         """
-        if not hasattr(self, 'copy_trade'):
-            return
-
-        # Only poll manual wallets (3-5 wallets, not all candidates)
-        wallets = list(self.copy_trade.wallets)[:5]
-
-        for wallet in wallets:
+        for wallet in self._wallets_to_poll():
             try:
-                # Get recent transaction signatures
-                result = await self.onchain._rpc_call("getSignaturesForAddress", [
-                    wallet, {"limit": 5, "commitment": "confirmed"}
+                # Strict call: an RPC failure raises, so it cannot be
+                # mistaken for "this wallet did nothing".
+                result = await self.onchain._rpc_call_strict("getSignaturesForAddress", [
+                    wallet, {"limit": self.WALLET_POLL_SIG_LIMIT, "commitment": "confirmed"}
                 ])
-                if not result:
-                    continue
+                self._wallet_poll_ok += 1
+                result = result or []
 
                 if wallet not in self._wallet_seen_sigs:
                     # First poll — just record signatures, don't process
@@ -1280,8 +1349,12 @@ class MemeBot:
                     if s.get("signature") and s["signature"] not in seen
                     and not s.get("err")  # skip failed txs
                 ]
+                if len(new_sigs) >= self.WALLET_POLL_SIG_LIMIT:
+                    log.info(f"  Wallet {wallet[:8]}... made more trades than one "
+                             f"poll can see — some were missed")
 
-                for sig in new_sigs[:3]:  # max 3 new txs per wallet per cycle
+                # Oldest first, so a buy is processed before its sell
+                for sig in list(reversed(new_sigs))[:self.WALLET_POLL_MAX_NEW]:
                     seen.add(sig)
                     try:
                         tx_data = await self.onchain._rpc_call("getTransaction", [
@@ -1293,13 +1366,22 @@ class MemeBot:
                         await self._parse_wallet_tx(wallet, tx_data, sig)
                     except Exception as e:
                         log.debug(f"  Wallet tx parse error: {e}")
+                # Anything not processed this cycle is dropped, not replayed late
+                seen.update(new_sigs)
 
                 # Cap seen signatures to prevent unbounded growth
-                if len(seen) > 100:
-                    self._wallet_seen_sigs[wallet] = set(list(seen)[-50:])
+                if len(seen) > 200:
+                    keep = {s.get("signature", "") for s in result}
+                    self._wallet_seen_sigs[wallet] = keep
 
             except Exception as e:
-                log.debug(f"  Wallet poll error for {wallet[:8]}: {e}")
+                self._wallet_poll_fail += 1
+                now = time.time()
+                if now - self._wallet_poll_warned_at > 300:
+                    self._wallet_poll_warned_at = now
+                    log.warning(f"  Wallet poll failed for {wallet[:8]}...: "
+                                f"{type(e).__name__}: {e} "
+                                f"({self._wallet_poll_fail} failures so far)")
 
     async def _parse_wallet_tx(self, wallet: str, tx_data: dict, sig: str):
         """Parse a wallet transaction to detect token buys/sells.
@@ -1360,6 +1442,8 @@ class MemeBot:
 
             if abs(token_change) < 0.001:
                 continue
+            if mint in self.COPY_IGNORE_MINTS:
+                continue   # a swap into SOL or a stablecoin, not a token buy
 
             if token_change > 0 and sol_change < -0.01:
                 # Bought tokens (SOL decreased, tokens increased)
@@ -1423,6 +1507,7 @@ class MemeBot:
                 if curve_pct <= 0:
                     continue
                 checked += 1
+                self.graduation.note_curve(mint, curve_pct)
 
                 if curve_pct >= self.graduation.min_curve:
                     near_grad += 1
@@ -1463,11 +1548,14 @@ class MemeBot:
                     continue
 
                 # Update the watching dict
+                self.graduation.note_curve(mint, curve_pct)
                 self.graduation.watching[mint] = curve_pct
                 self.graduation._watching_times[mint] = time.time()
 
-                # Detect graduation (100% curve = bonding curve complete)
-                if curve_pct >= 100 and mint not in self.graduation._graduated_at:
+                # Detect graduation (100% curve = bonding curve complete).
+                # Only for tokens we saw below 100% ourselves.
+                if (curve_pct >= 100 and mint not in self.graduation._graduated_at
+                        and mint in self.graduation._seen_below):
                     cand = self.mint_pool.candidates.get(mint)
                     symbol = cand.symbol if cand else mint[:8]
                     self.notify.graduation_alert(symbol, mint, curve_pct)
@@ -1521,6 +1609,24 @@ class MemeBot:
                     log.info(f"  POST-GRAD: {symbol} — low liquidity ${token_data.liquidity_usd:,.0f}, waiting...")
                     continue
 
+                # A fresh graduate has a pool that is minutes old. An old pool
+                # means this token graduated long ago and was mis-detected.
+                pool_age_min = (token_data.age_minutes
+                                if token_data.pair_created_at > 0 else None)
+                if pool_age_min is None or pool_age_min > self.cfg.grad_max_pool_age_min:
+                    age_txt = "unknown" if pool_age_min is None else f"{pool_age_min:.0f}m"
+                    log.info(f"  POST-GRAD: {symbol} — pool age {age_txt} "
+                             f"(max {self.cfg.grad_max_pool_age_min:.0f}m), not a fresh graduate")
+                    self.graduation.mark_bought(mint)
+                    continue
+
+                # A 5-minute change of 0 with no trades is missing data, not
+                # a calm market. Wait for real trading before judging entry.
+                txns_5m = token_data.buys_5m + token_data.sells_5m
+                if txns_5m < self.cfg.grad_min_txns_5m:
+                    log.info(f"  POST-GRAD: {symbol} — only {txns_5m} trades in 5m, waiting...")
+                    continue
+
                 # Prefer post-dump entries: tokens with negative/low 5m%
                 # have already shed FOMO buyers and found a floor.
                 # Skip extreme FOMO tops and deep dumps.
@@ -1535,8 +1641,8 @@ class MemeBot:
                     continue
 
                 # Confidence/sizing gradient: post-dump floor gets largest
-                # position, chasing gets smallest. Wider spread to reflect
-                # 80% vs 20% win rate difference in backtest data.
+                # position, chasing gets smallest. These buckets are a
+                # heuristic; there is no recorded trade data behind them.
                 if -15 <= change_5m <= -5:
                     conf = 0.85  # sweet spot: post-dump floor
                 elif change_5m < -15:
@@ -1622,7 +1728,7 @@ class MemeBot:
                     self.rug_detector.update_curve_pct(mint, curve_pct)
                 # Detect graduation
                 if curve_pct >= 100 and not pos.graduated:
-                    self.risk.mark_graduated(mint)
+                    self.risk.mark_graduated(mint, grace=True)
                     self._graduated_cache[mint] = True
                     log.info(f"  {pos.symbol} graduated — curve hit {curve_pct:.1f}% (5min grace active)")
         except Exception:
@@ -1931,6 +2037,40 @@ class MemeBot:
                     log.info(f"  Creator active ({oc.creator_token_count} recent txs) — {signal.symbol}")
         return True
 
+    def _paper_costs(self, trade_sol: float, jupiter: bool,
+                     emergency: bool = False) -> tuple[float, float]:
+        """(fixed SOL, percentage) a live trade of this kind would cost.
+
+        The fixed part mirrors what the live path sends: the priority fee
+        (after the size cap) and the Jito tip on pump.fun trades, a flat
+        assumed network fee on Jupiter trades. The percentage (PAPER_FEE_PCT)
+        stands for the pump.fun and PumpPortal fees and is an assumption.
+        """
+        if jupiter:
+            fixed = self.cfg.paper_jupiter_fee_sol
+        else:
+            fixed = self.cfg.priority_fee_for(trade_sol, emergency=emergency)
+        if self.cfg.use_jito and not emergency:
+            fixed += self.cfg.jito_tip_sol
+        return fixed, self.cfg.paper_fee_pct
+
+    def _log_fee_overhead(self):
+        """Say up front how much of each position the fixed fees eat."""
+        for name, cap in (("momentum", self.cfg.momentum_max_buy_sol),
+                          ("copy_trade", self.cfg.copy_max_buy_sol),
+                          ("sniper", self.cfg.max_buy_sol)):
+            if name not in self.strategies_enabled or cap <= 0:
+                continue
+            tip = self.cfg.jito_tip_sol if self.cfg.use_jito else 0.0
+            round_trip = 2 * (self.cfg.priority_fee_for(cap) + tip)
+            pct = round_trip / cap * 100
+            line = (f"  Fixed fees for {name}: ~{round_trip:.4f} SOL per round trip "
+                    f"= {pct:.0f}% of a {cap:g} SOL position")
+            if pct >= 15:
+                log.warning(line + " — the trade must gain that much to break even")
+            else:
+                log.info(line)
+
     async def _execute_buy_checked(self, signal: Signal, size: float,
                                    auto_sell_sec: int = 0):
         mint = signal.mint
@@ -1967,9 +2107,17 @@ class MemeBot:
                 sol_price = await self.market.get_sol_price()
                 price_usd = price_sol * sol_price
 
-            tokens = (size / price_sol) if price_sol > 0 else 0
+            # Model the costs a live buy would pay; the outlay stays `size`.
+            via_jupiter = signal.strategy == "graduation" and self.cfg.use_jupiter
+            fixed, fee_pct = self._paper_costs(size, via_jupiter)
+            net = (max(size - fixed, 0) * (1 - fee_pct / 100)
+                   * (1 - self.cfg.paper_slippage_pct / 100))
+            tokens = (net / price_sol) if price_sol > 0 else 0
             if tokens <= 0:
                 return
+            log.info(f"  Paper costs: {size - net:.4f} of {size:.4f} SOL "
+                     f"({fixed:.4f} fixed + {fee_pct:g}% fees + "
+                     f"{self.cfg.paper_slippage_pct:g}% slippage)")
 
             ok = self.wallet.buy(mint, signal.symbol, size, tokens, price_usd)
             if ok:
@@ -2014,10 +2162,15 @@ class MemeBot:
             slippage = (self.cfg.momentum_slippage_pct
                         if signal.strategy == "momentum"
                         else self.cfg.slippage_pct)
+            buy_fee = self.cfg.priority_fee_for(size)
+            if buy_fee < self.cfg.priority_fee_sol:
+                log.info(f"  Priority fee capped at {buy_fee:.5f} SOL "
+                         f"({self.cfg.max_fee_pct_of_trade:g}% of the trade; "
+                         f"configured {self.cfg.priority_fee_sol:g})")
             result = await self.pump.buy(
                 mint, size,
                 slippage=slippage,
-                priority_fee=self.cfg.priority_fee_sol,
+                priority_fee=buy_fee,
             )
 
         if result.failed:
@@ -2319,6 +2472,12 @@ class MemeBot:
 
     async def _on_position_opened(self, mint: str, creator: str = ""):
         """Hook called after a position is successfully opened."""
+        # For copy trades `creator` is the wallet we copied. Its sells are
+        # handled by copy-sell mirroring; treating it as the token's creator
+        # would turn them into "creator sold" rug exits and blacklist it.
+        pos = self.risk.positions.get(mint)
+        if pos and pos.strategy == "copy_trade":
+            creator = ""
         if hasattr(self, 'rug_detector') and self.cfg.rug_detection:
             curve_sol = 0
             curve_pct = 0.0
@@ -2350,8 +2509,13 @@ class MemeBot:
             self._mint_cooldowns[mint] = time.time() + self.cfg.mint_cooldown_minutes * 60
             log.info(f"  Cooldown: {mint[:12]}... blocked for {self.cfg.mint_cooldown_minutes}m")
 
+        # For copy trades `creator` holds the wallet we copied, not the
+        # token's creator: score that wallet, and never blacklist it as a
+        # token creator.
+        is_copy = strategy == "copy_trade"
+
         # Auto-blacklist creator on loss
-        if pnl is not None and pnl < 0:
+        if pnl is not None and pnl < 0 and not is_copy:
             if creator and hasattr(self, 'sniper'):
                 self.sniper.blacklist_creator(creator)
             # Persist blacklist for significant losses (likely rugs)
@@ -2359,8 +2523,9 @@ class MemeBot:
                 self.db.blacklist_creator(creator, f"loss {pnl:.4f} SOL ({strategy})")
                 log.info(f"  Creator {creator[:8]}... blacklisted after {strategy} loss")
 
-        # Score creator wallet for ALL strategies (feeds wallet discovery)
-        if pnl is not None and creator:
+        # Wallet scores rank COPY wallets (copy confidence, sizing, promotion
+        # and demotion). Token creators are deliberately kept out of them.
+        if pnl is not None and creator and is_copy:
             try:
                 self.db.update_wallet_score(creator, pnl, 0, mint, pnl >= 0)
             except Exception:
@@ -2403,8 +2568,15 @@ class MemeBot:
                 slippage = self.cfg.paper_slippage_pct
                 if "stop_loss" in reason or "rug" in reason.lower():
                     slippage *= 2  # emergency exits get worse execution
-                sol_received = sol_received_raw * (1 - slippage / 100)
-                log.info(f"  Paper slippage: {slippage:.1f}% applied "
+                emergency = self._is_emergency(reason)
+                via_jupiter = pos.graduated and self.cfg.use_jupiter
+                fixed, fee_pct = self._paper_costs(
+                    pos.sol_invested * sell_pct / 100, via_jupiter, emergency)
+                sol_received = max(
+                    sol_received_raw * (1 - slippage / 100) * (1 - fee_pct / 100)
+                    - fixed, 0.0)
+                log.info(f"  Paper costs: {slippage:.1f}% slippage + {fee_pct:g}% fees + "
+                         f"{fixed:.4f} SOL fixed "
                          f"({sol_received_raw:.4f} → {sol_received:.4f} SOL)")
                 pnl = self.wallet.sell(mint, sell_tokens, sol_received,
                                         token_data.price_usd)
@@ -2495,8 +2667,14 @@ class MemeBot:
         graduated = pos.graduated if is_emergency else await self._is_graduated(mint, pos)
 
         sell_slippage = 40 if is_emergency else self.cfg.slippage_pct
-        sell_fee = (min(self.cfg.priority_fee_sol * 2, 0.01) if is_emergency
+        trade_sol = pos.sol_invested * sell_pct / 100
+        sell_fee = self.cfg.priority_fee_for(trade_sol, emergency=is_emergency)
+        uncapped = (min(self.cfg.priority_fee_sol * 2, 0.01) if is_emergency
                     else self.cfg.priority_fee_sol)
+        if sell_fee < uncapped:
+            log.info(f"  Priority fee capped at {sell_fee:.5f} SOL "
+                     f"({self.cfg.max_fee_pct_of_trade:g}% of the trade; "
+                     f"would be {uncapped:g})")
         resend = not is_partial   # re-sending a partial sell would oversell
 
         if graduated and self.cfg.use_jupiter:
@@ -2536,7 +2714,7 @@ class MemeBot:
             else:
                 # Last resort: max slippage, skip Jito, higher fee
                 log.error(f"  Sell FAILED for {pos.symbol} — last-resort retry")
-                retry_fee = min(self.cfg.priority_fee_sol * 2,
+                retry_fee = min(self.cfg.priority_fee_for(trade_sol, emergency=True),
                                 pos.sol_invested * 0.15)
                 result = await self.pump.sell(
                     mint, sell_pct=sell_pct,
@@ -2736,7 +2914,10 @@ class MemeBot:
             return False
         self._graduated_cache[mint] = graduated
         if graduated:
-            self.risk.mark_graduated(mint)
+            # Grace (stop suppressed) only if we held it on the curve and so
+            # are living through the migration. A token that was already
+            # graduated when bought keeps its stop-loss.
+            self.risk.mark_graduated(mint, grace=0 < pos.curve_pct < 100)
             log.info(f"  {pos.symbol} has graduated from pump.fun")
         return graduated
 
@@ -2784,6 +2965,12 @@ class MemeBot:
         # Copy trade stats
         if "copy_trade" in self.strategies_enabled:
             log.info(f"  Copy trade events received: {self._copy_event_count}")
+            log.info(f"  Wallet RPC polls: {self._wallet_poll_ok} ok, "
+                     f"{self._wallet_poll_fail} failed")
+        feed = ("REFUSED by PumpPortal (needs PUMPPORTAL_TRADE_FEED=true and a funded API key)"
+                if getattr(self.stream, "trade_feed_rejected", False)
+                else f"{getattr(self.stream, 'trade_events', 0)} events")
+        log.info(f"  Trade feed: {feed}")
 
         # Rug detection stats
         if hasattr(self, 'rug_detector'):
@@ -2843,6 +3030,9 @@ class MemeBot:
         # Stop the WebSocket reader and the loops first, so no new trade can
         # start while we are shutting down (and no task outlives the loop).
         main_tasks = [t for t in getattr(self, "_main_tasks", []) if not t.done()]
+        poll_task = getattr(self, "_wallet_poll_task", None)
+        if poll_task and not poll_task.done():
+            main_tasks.append(poll_task)
         for t in main_tasks:
             t.cancel()
         if main_tasks:

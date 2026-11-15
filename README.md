@@ -143,12 +143,27 @@ Leave empty for paper trading. For live trading, set to your wallet's base58-enc
 
 ```env
 PUMPPORTAL_API_KEY=
+PUMPPORTAL_TRADE_FEED=false
 ```
 
 | Mode | API Key | Description |
 |------|---------|-------------|
 | Local (free) | Empty | Bot builds and signs transactions, sends via your RPC |
 | Lightning | Set key | PumpPortal signs and sends for you (faster) |
+
+**The trade feed is opt-in and billed.** PumpPortal only serves per-token and per-wallet trade events (`subscribeTokenTrade`, `subscribeAccountTrade`) to WebSocket connections made with an API key whose linked wallet holds at least 0.02 SOL, and it charges that wallet 0.01 SOL per 10,000 trade events (per PumpPortal's data API page; check the current terms). New-token events are free and need no key.
+
+Because the charge is real SOL even in paper mode, the bot connects with the key only when `PUMPPORTAL_TRADE_FEED=true`. If the keyed connection is refused outright, it falls back to the free feed. With the feed off, or with an unfunded key:
+
+| Feature | Effect |
+|---------|--------|
+| Copy trade | No WebSocket events; relies on RPC polling only (up to ~30s late) |
+| Rug detection | Creator-sell triggers never fire; only the 15-second on-chain curve check remains |
+| Momentum | Buyer-uniqueness (Sybil) check and live-activity ranking have no data |
+| Wallet discovery | No candidates are ever observed |
+| WebSocket price exits | None; exits rely on polled prices |
+
+The bot logs `PumpPortal refused the trade subscriptions` at startup when this happens, and the status report shows `Trade feed: REFUSED`. With the feed on, the status report shows the number of trade events received, which is what you are billed for.
 
 ### 4.4 -- Trading Mode
 
@@ -159,9 +174,29 @@ NOTIFY_ONLY=false
 
 | Setting | Behavior |
 |---------|----------|
-| `paper` | Simulates trades with virtual SOL balance |
+| `paper` | Simulates trades with a virtual SOL balance, charging the fees and slippage a live trade would pay (see below) |
 | `live` | Executes real trades on Solana mainnet |
 | `NOTIFY_ONLY=true` | Runs full pipeline but only sends alerts, does not execute |
+
+**Paper-mode cost model**
+
+```env
+PAPER_SLIPPAGE_PCT=3.0
+PAPER_FEE_PCT=1.5
+PAPER_JUPITER_FEE_SOL=0.0005
+```
+
+Paper trades are charged on both the buy and the sell:
+
+| Cost | pump.fun trades | Jupiter trades (graduated) |
+|------|-----------------|----------------------------|
+| Fixed | `PRIORITY_FEE_SOL` (after the `MAX_FEE_PCT_OF_TRADE` cap) plus `JITO_TIP_SOL` when `USE_JITO=true` | `PAPER_JUPITER_FEE_SOL` plus the Jito tip |
+| Percentage | `PAPER_FEE_PCT` | `PAPER_FEE_PCT` |
+| Slippage | `PAPER_SLIPPAGE_PCT` (doubled on stop-loss and rug exits) | same |
+
+`PAPER_FEE_PCT` and `PAPER_JUPITER_FEE_SOL` are assumptions, not measured values. Adjust them to what you observe on real transactions. Paper mode still cannot model failed transactions or being outrun by faster bots, so treat its results as an upper bound.
+
+Paper and live runs must use separate database files (`--db`). The bot refuses to start on a database that holds open positions from the other mode.
 
 ### 4.5 -- Strategy Selection
 
@@ -172,7 +207,7 @@ STRATEGY=multi
 | Value | Description |
 |-------|-------------|
 | `sniper` | Buy new tokens within seconds of creation |
-| `momentum` | Buy tokens with strong price and volume momentum |
+| `momentum` | Buy new pump.fun tokens whose bonding curve is growing (on-chain pipeline, Section 8) |
 | `copy_trade` | Mirror trades from smart money wallets |
 | `graduation` | Buy tokens after they graduate from pump.fun |
 | `multi` | Run all four strategies simultaneously |
@@ -191,7 +226,7 @@ DAILY_LOSS_LIMIT_SOL=0.3
 MAX_DAILY_TRADES=30
 ```
 
-Each strategy has its own cap. The bot also applies dynamic sizing based on signal confidence and strategy performance (see Section 11).
+Each strategy has its own cap, and the cap is a ceiling: confidence and recent performance can only reduce a position below it (see Section 11).
 
 ### 4.7 -- Exit Strategy
 
@@ -209,6 +244,8 @@ GRADUATED_TRAILING_2_PCT=35
 FAST_STOP_GRACE_SEC=180
 NOSTOP_WINDOW_SEC=180
 NOSTOP_MULTIPLIER=4
+NOSTOP_MAX_STOP_PCT=40
+PROTECTED_STOP_PCT=50
 WS_STOP_LOSS_ENABLED=false
 ```
 
@@ -218,7 +255,9 @@ WS_STOP_LOSS_ENABLED=false
 |-----------|---------|-------------|
 | `FAST_STOP_GRACE_SEC` | 180 | Seconds after buy before the fast stop-loss checker can trigger. Prevents exits on entry slippage. |
 | `NOSTOP_WINDOW_SEC` | 180 | Seconds after buy during which the stop-loss threshold is widened (multiplied by `NOSTOP_MULTIPLIER`). |
-| `NOSTOP_MULTIPLIER` | 4 | Stop-loss multiplier during the no-stop window. E.g. 12% stop becomes 48% during the window. |
+| `NOSTOP_MULTIPLIER` | 4 | Stop-loss multiplier during the no-stop window. |
+| `NOSTOP_MAX_STOP_PCT` | 40 | Upper limit for the widened stop. A 12% stop x 4 = 48% is held at 40%; a 20% stop x 4 = 80% is held at 40%. Never tighter than the normal stop. |
+| `PROTECTED_STOP_PCT` | 50 | Loss at which a position exits even while its stop is suppressed (curve-protected mode or graduation grace). |
 | `WS_STOP_LOSS_ENABLED` | false | Whether WebSocket-derived prices can trigger stop-losses. Disabled by default because single-trade implied prices are noisy. WS take-profits still fire. |
 
 The exit cascade:
@@ -279,11 +318,20 @@ Comma-separated list of wallet addresses. See Section 12 for details.
 ```env
 GRAD_MIN_CURVE_PCT=75
 GRAD_BUY_AT_PCT=88
+GRAD_MAX_POOL_AGE_MIN=30
+GRAD_MIN_TXNS_5M=5
 USE_JUPITER=true
 JUPITER_SLIPPAGE_BPS=1500
 ```
 
-The bot tracks tokens approaching graduation, detects the event, waits 60-120s for the pool to establish, then buys via Jupiter.
+The bot tracks tokens approaching graduation, detects the event, waits 60-300s for the pool to establish, then buys via Jupiter.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `GRAD_MIN_CURVE_PCT` | 75 | Start tracking a token at this curve fill %. |
+| `GRAD_BUY_AT_PCT` | 95 | Not used. It dates from when the bot bought before graduation; buys now happen only after it. |
+| `GRAD_MAX_POOL_AGE_MIN` | 30 | A post-graduation buy needs a DEX pool no older than this. An older pool means the token graduated long ago. |
+| `GRAD_MIN_TXNS_5M` | 5 | Minimum trades in the last 5 minutes on DexScreener. Below this the bot waits, because a 0% price change with no trades is missing data, not a calm market. |
 
 ### 4.13 -- Rug Detection
 
@@ -302,7 +350,10 @@ MIN_WALLET_SCORE_TO_WATCH=50.0
 WALLET_DISCOVERY_MIN_BUYS=2
 WALLET_DISCOVERY_MIN_SELLS=1
 WALLET_DISCOVERY_MIN_RATIO=1.15
+WALLET_DISCOVERY_MIN_TOKENS=3
 ```
+
+See Section 13 for how these are applied.
 
 ### 4.15 -- Execution
 
@@ -310,10 +361,17 @@ WALLET_DISCOVERY_MIN_RATIO=1.15
 SLIPPAGE_PCT=15
 MOMENTUM_SLIPPAGE_PCT=12
 PRIORITY_FEE_SOL=0.005
+MAX_FEE_PCT_OF_TRADE=5
 JITO_TIP_SOL=0.001
 USE_JITO=true
 POLL_INTERVAL_SEC=3
 ```
+
+**Fees against position size.** `PRIORITY_FEE_SOL` is a fixed amount per transaction, so on a small position it is a large share of the trade: 0.005 SOL on each side of a 0.03 SOL position is a third of the stake before any price move. `MAX_FEE_PCT_OF_TRADE` caps the priority fee at a percentage of the trade's SOL size (5% of 0.03 SOL = 0.0015 SOL). Emergency sells (stop-loss, rug) pay double. Set it to `0` to always send `PRIORITY_FEE_SOL` unchanged. A lower fee can make transactions land more slowly in congested periods.
+
+At startup the bot logs the fixed fees per round trip as a share of each enabled strategy's position size, and warns when it is 15% or more.
+
+This cap applies to pump.fun trades through PumpPortal. Jupiter trades use Jupiter's automatic priority fee.
 
 ### 4.16 -- Telegram
 
@@ -343,7 +401,8 @@ PIPELINE_MAX_TOP_HOLDER_PCT=50
 
 ```bash
 cd src
-python main.py                              # default paper mode
+python main.py                              # mode from TRADING_MODE in .env (default paper)
+python main.py --paper                      # force paper mode, whatever .env says
 python main.py --strategy copy_trade,graduation
 python main.py --debug                      # verbose logging
 python main.py --max-sol 0.05
@@ -362,13 +421,13 @@ A 5-second safety countdown runs before live trading starts.
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--paper` | Paper trading mode | On |
+| `--paper` | Force paper trading, overriding `TRADING_MODE` | From `.env` |
 | `--live` | Live trading mode | Off |
 | `--strategy STR` | Strategy override | From `.env` |
 | `--max-sol FLOAT` | Max SOL per trade | From `.env` |
 | `--interval INT` | Poll interval (seconds) | From `.env` |
 | `--debug` | Debug logging | Off |
-| `--db PATH` | Database file path | `bot_state.db` |
+| `--db PATH` | Database file path. Use a separate file for paper and live runs | `bot_state.db` |
 
 ### Background Execution
 
@@ -454,11 +513,15 @@ main.py (CLI + config)
 
 ### Concurrent Loops
 
-The bot runs two async loops concurrently:
+The bot runs three long-lived tasks, plus short background tasks for each trade and for the copy-wallet RPC poll:
 
 1. **WebSocket loop** (`_main_loop`): Event-driven, processes PumpPortal events in real-time (new tokens, wallet trades, token trades).
 
 2. **Poll loop** (`_poll_loop`): Periodic tasks every 3 seconds -- position monitoring, momentum scanning, graduation polling, rug checks, Telegram event handling.
+
+3. **Fast stop-loss loop** (`_fast_position_check`): Checks open positions every 500ms.
+
+Buys and sells run as background tasks so a slow confirmation never blocks these loops.
 
 ### Module Map
 
@@ -466,14 +529,15 @@ The bot runs two async loops concurrently:
 |--------|-----|------|
 | `main.py` | 109 | CLI entry point, argument parsing, logging setup |
 | `bot.py` | 2,311 | Main orchestrator: event loop, 3-stage pipeline, trade execution, crash recovery |
-| `strategies.py` | 493 | 4 strategy classes, each emits `Signal` or `SellSignal` objects |
+| `strategies.py` | 440 | Sniper, CopyTrade and Graduation classes, emitting `Signal` or `SellSignal` objects. Momentum is the pipeline in `bot.py` |
+| `txutil.py` | 237 | Shared transaction helpers: trade outcome (confirmed / failed / unknown), confirmation, transaction parsing |
 | `pumpportal.py` | 486 | PumpPortal REST API + WebSocket client, Jito bundle support |
 | `onchain.py` | 626 | On-chain analysis via Solana RPC: mint/freeze authority, holders, bonding curve |
 | `safety.py` | 120 | Dual-layer safety checks wrapping DexScreener and on-chain data |
 | `risk_manager.py` | 466 | Position tracking, exit logic (9 exit types), dynamic sizing, loss cooldowns |
 | `rug_detector.py` | 238 | Real-time rug detection: creator sells, curve drops, whale dumps |
 | `jupiter.py` | 229 | Jupiter V6 swap routing for graduated tokens |
-| `wallet_discovery.py` | 206 | Auto-discover and score profitable wallets |
+| `wallet_discovery.py` | 250 | Auto-discover wallets worth copying from observed round trips |
 | `market_data.py` | 223 | DexScreener + Jupiter Price API wrappers with caching |
 | `db.py` | 397 | SQLite persistence: positions, trades, wallet scores, blacklists, loss streaks |
 | `config.py` | 267 | Environment variable loading, validation, Solana program constants |
@@ -487,9 +551,9 @@ The bot runs two async loops concurrently:
 
 | Source | Protocol | Used By |
 |--------|----------|---------|
-| PumpPortal | WebSocket (`wss://pumpportal.fun/api/data`) | Sniper, CopyTrade, Graduation, MintPool, Rug Detector |
+| PumpPortal | WebSocket (`wss://pumpportal.fun/api/data`) | Sniper, CopyTrade, Graduation, MintPool, Rug Detector. Trade events need a funded API key (Section 4.3) |
 | DexScreener | REST API | Momentum, Safety Layer 1, Post-graduation verification |
-| Jupiter | REST API (`quote-api.jup.ag`) | Post-graduation swaps, SOL price |
+| Jupiter | REST API (`lite-api.jup.ag`) | Post-graduation swaps, SOL price |
 | Solana RPC | JSON-RPC | Safety Layer 2, bonding curve reads, balance queries |
 | Jito | REST API | MEV bundle submission |
 
@@ -544,7 +608,7 @@ Listens to PumpPortal WebSocket for new token creation events. Evaluates tokens 
 - Token has name and metadata (+0.1 to +0.2)
 - Market cap between 5-100 SOL (+0.2)
 - Liquidity above minimum (+0.15)
-- Minimum confidence: 0.25
+- Minimum confidence: 0.45
 
 **Auto-sell:** After `SNIPER_AUTO_SELL_SEC` seconds, the position is closed regardless of price.
 
@@ -559,13 +623,14 @@ Evaluates tokens through the 3-stage discovery pipeline (see Section 8). Scores 
 - Growth rate above `MIN_MOMENTUM_GROWTH_RATE` percent per minute
 - Minimum transaction count and SOL in curve
 - Buyer uniqueness above 30% (Sybil detection)
+- Curve higher than at an earlier pipeline cycle (sustained growth)
 - On-chain safety pass (mint/freeze authority, holder concentration)
 
 **Confidence:** 0.65 to 1.0 based on growth rate, transaction velocity, uniqueness, and age.
 
 ### 7.3 -- Copy Trade
 
-Subscribes to PumpPortal WebSocket for trade events from configured smart money wallets. Mirrors buys and exits.
+Subscribes to PumpPortal WebSocket for trade events from configured smart money wallets, and polls the same wallets over RPC to catch trades on other DEXes. Mirrors buys and exits.
 
 **Buy signals:**
 - Baseline confidence: 0.3 to 0.9 (based on wallet score)
@@ -584,13 +649,17 @@ Subscribes to PumpPortal WebSocket for trade events from configured smart money 
 Monitors tokens approaching bonding curve graduation (100% = ~85 SOL). Detects the graduation event, waits for the PumpSwap/Raydium pool to establish, then buys via Jupiter.
 
 **Flow:**
-1. Track tokens at 75%+ curve fill (on-chain RPC polling)
-2. Detect graduation (curve hits 100% or complete flag)
-3. Wait 60-120 seconds for pool liquidity
-4. Verify via DexScreener (liquidity, price change, market cap)
-5. Execute buy via Jupiter V6 swap
+1. Track tokens at `GRAD_MIN_CURVE_PCT`+ curve fill (on-chain RPC polling)
+2. Detect graduation: the curve reads 100% on-chain **and** the bot read the same token below 100% earlier
+3. Wait 60-300 seconds for pool liquidity
+4. Verify via DexScreener: liquidity of $5,000+, pool no older than `GRAD_MAX_POOL_AGE_MIN`, at least `GRAD_MIN_TXNS_5M` trades in 5 minutes, 5-minute change between -30% and +150%
+5. Execute buy via Jupiter swap
 
-**Post-graduation positions** receive wider exit parameters: 35% trailing stop, TP2 sells only 50% (holds remainder for continued upside).
+**Detection guards.** A token that had already graduated before the bot first saw it is ignored, so an event for an old token is never treated as a fresh graduation. The curve percentage estimated from WebSocket event data is used only to skip RPC calls for tokens far from graduation; it never declares a graduation.
+
+**Entry sizing.** Confidence is highest for a 5-minute change of -15% to -5%, then for a flat price, and lowest when chasing a rise. These buckets are a heuristic with no recorded trade data behind them.
+
+**Post-graduation positions** receive wider trailing parameters: 35% trailing stop, TP2 sells only 50% (holds remainder for continued upside). Their stop-loss is armed from entry; the 5-minute graduation grace applies only to positions that were held through the migration.
 
 ---
 
@@ -602,23 +671,18 @@ The momentum strategy uses a 3-stage pipeline to filter tokens from WebSocket ev
 
 All new token creation events are collected into a scored candidate pool. Each candidate is scored by:
 
-- **Age sweet spot:** 5-12 minutes old scores highest
+- **Age:** for momentum, tokens up to 6 minutes old score highest and the score falls off to nothing past 10 minutes, matching the Stage 3 scorer. The graduation poll ranks the same pool with a 5-12 minute sweet spot instead.
+- **Live activity (momentum only):** trades seen on the WebSocket since creation (10+ and 30+ add to the score)
 - **Initial buy amount:** Creator's initial buy (log-scaled, proof of commitment)
 - **Market cap at creation:** Higher initial interest scores better
 
-The pool holds up to 600 candidates, pruning the oldest when full. The top 20-30 candidates by score are passed to Stage 2.
+The pool holds up to 600 candidates, pruning the oldest when full. The top 20 candidates by score are passed to Stage 2.
 
-### Stage 2 -- On-Chain Verification
+### Stage 2 -- On-Chain Activity Check
 
-Candidates are verified via Solana RPC:
+Ten candidates per cycle are checked for recent activity: the six best-ranked, plus four that rotate through the rest of the top 20 so lower-ranked tokens are still looked at. A candidate needs at least 5 transactions on its bonding curve in the last 5 minutes (falling back to the WebSocket trade count when the RPC returns nothing). The count reads up to 300 signatures.
 
-- Mint authority revoked (required)
-- Freeze authority revoked (required)
-- Top holder concentration (< 50%)
-- Creator transaction history (< 80 recent txns)
-- Bonding curve state and growth rate
-
-Only candidates passing all on-chain checks advance to Stage 3.
+Active candidates advance to Stage 3. The on-chain safety checks (freeze authority, holder concentration, creator history) run later, on any signal that Stage 3 emits, before the buy.
 
 ### Stage 3 -- Momentum Evaluation
 
@@ -626,7 +690,8 @@ Surviving candidates are evaluated for trading momentum:
 
 - **Curve growth:** Percent increase in bonding curve SOL since creation
 - **Growth rate:** Curve growth per minute (filters whale-only pumps)
-- **Transaction rate:** Buys per minute
+- **Transaction rate:** Transactions per minute over the last 5 minutes (or the token's age, if younger)
+- **Sustained growth:** The curve must be higher than at a pipeline cycle 4-90 seconds earlier. A token seen for the first time waits one cycle (`2PT-WAIT` in the log); one that has not grown is skipped (`2PT-FAIL`). A 2-second recheck then confirms the curve is not falling.
 - **Buyer uniqueness:** Unique wallets / total buys (Sybil detection)
   - Below 30%: hard block (likely wash trading)
   - Above 80%: confidence boost
@@ -671,6 +736,8 @@ Pass thresholds:
 - Regular: final >= 40, liquidity >= 30, honeypot >= 20, freeze revoked
 - Snipe: final >= 25, honeypot >= 15, freeze revoked, top holder within limit
 
+**Unreadable data.** With `SAFETY_FAIL_CLOSED=true` (default), a buy is skipped when the on-chain data could not be read (RPC error). The log shows `Safety SKIP` and the token is not blacklisted. Set it to `false` to proceed without the on-chain layer.
+
 ---
 
 ## 10. Rug Detection
@@ -709,10 +776,12 @@ Checks on-chain state every 15 seconds per token:
 ### Dynamic Position Sizing
 
 ```
-Final Size = Base Size x Confidence Multiplier x Strategy Multiplier x Wallet Multiplier
+Final Size = min(Base Size x Confidence x Strategy x Wallet multipliers, Base Size)
 ```
 
-**Base size:** Minimum of MAX_BUY_SOL, 15% of balance, or remaining portfolio capacity.
+**Base size:** Minimum of the strategy's cap, 15% of balance, or remaining portfolio capacity.
+
+The base size is the ceiling. The multipliers below can only reduce a position; a multiplier above 1 just offsets another one below 1.
 
 **Confidence multiplier (0.5x to 1.5x):**
 - Signal confidence 0.25 -> 0.75x
@@ -744,17 +813,17 @@ The risk manager evaluates 9 exit conditions on every position check (every 3 se
 
 **Fast stop-loss grace:** The fast stop-loss checker (500ms polling) does not fire until `FAST_STOP_GRACE_SEC` (default 180s) after entry. This prevents exits from entry slippage and normal early volatility.
 
-**No-stop window:** For `NOSTOP_WINDOW_SEC` (default 180s) after entry, the stop-loss threshold is multiplied by `NOSTOP_MULTIPLIER` (default 4x), requiring a much larger drop to trigger. This applies in both the fast checker and the main poll loop.
+**No-stop window:** For `NOSTOP_WINDOW_SEC` (default 180s) after entry, the stop-loss threshold is multiplied by `NOSTOP_MULTIPLIER` (default 4x) but never above `NOSTOP_MAX_STOP_PCT` (default 40%). This applies in both the fast checker and the main poll loop.
 
 **Stop-loss confirmation:** Price must stay below the stop threshold for 8 seconds to trigger, filtering out momentary volatility spikes. Catastrophic dumps (multiplier x threshold) trigger immediate exit.
 
 **WebSocket stop-losses:** Disabled by default (`WS_STOP_LOSS_ENABLED=false`). Single-trade implied prices are noisy and trigger false stop-losses. WS take-profits and trailing stops still fire normally.
 
-**Curve-protected mode:** When the bonding curve is above 60% and rising with fresh data (< 30s old), the stop-loss is suppressed to allow the token to reach graduation. Only -80% dumps or 15%+ curve drops trigger exit.
+**Curve-protected mode:** When the bonding curve is above 60% and rising with fresh data (< 30s old), the stop-loss is suppressed to allow the token to reach graduation. Only a loss of `PROTECTED_STOP_PCT` (default 50%) or a 15%+ curve drop triggers exit.
 
-**Graduation grace period:** For 5 minutes after a token graduates, stop-loss is suppressed to survive the Raydium migration price dip.
+**Graduation grace period:** For 5 minutes after a held position graduates, stop-loss is suppressed (down to `PROTECTED_STOP_PCT`) to survive the migration price dip. This applies only to positions the bot held on the bonding curve. A token bought after it graduated, or found already graduated, keeps its normal stop.
 
-**Balance confirmation on sells:** After a live sell transaction, the bot retries the balance check up to 3 times (2s, 4s delays) to avoid recording 0 SOL received due to RPC lag.
+**Sell verification:** A live position is closed only when the sell transaction is confirmed or the wallet's token balance shows the tokens are gone. A sell that cannot be verified leaves the position open and is retried (every 30s, then every 5 minutes after 10 failures, with a Telegram alert). Positions are never written off while the tokens are still held.
 
 ### Loss Cooldowns
 
@@ -819,7 +888,15 @@ sqlite3 bot_state.db "SELECT substr(wallet,1,12)||'...' as wallet, ROUND(score,1
 
 ### Limitation
 
-PumpPortal `subscribeAccountTrade` only covers pump.fun bonding curve trades. If watched wallets trade on Raydium or Jupiter (graduated tokens), those events will not be received. The bot supplements this with periodic RPC polling of wallet transactions.
+PumpPortal `subscribeAccountTrade` only covers pump.fun bonding curve trades. If watched wallets trade on Raydium or Jupiter (graduated tokens), those events will not be received over the WebSocket. The bot supplements this with RPC polling of wallet transactions:
+
+- Runs about every 30 seconds in the background, so a copied trade can be up to ~30 seconds late.
+- Polls up to 8 wallets: your `COPY_WALLETS` first, then auto-discovered ones.
+- Reads the last 15 signatures per wallet and processes up to 8 new ones, oldest first. A wallet that trades more than that between polls has some trades missed, and the log says so.
+- Ignores swaps into wrapped SOL, USDC and USDT.
+- Failures are logged as warnings (`Wallet poll failed`), and the status report shows `Wallet RPC polls: N ok, M failed`, so a broken poller is distinguishable from idle wallets.
+
+Scores are kept for copy wallets only. Token creators are never written to `wallet_scores`, and a losing copy trade does not blacklist the copied wallet as a creator.
 
 ---
 
@@ -829,11 +906,16 @@ The bot can automatically discover and promote profitable wallets for copy tradi
 
 ### How It Works
 
-1. **Observation:** Every trade event from the WebSocket is recorded. The bot tracks buy/sell counts and SOL amounts per wallet.
+1. **Observation:** Trade events from the WebSocket are recorded per wallet and per token. The bot only sees a token's trades while it is subscribed to that token, so a wallet whose first visible trade on a token is a sell bought before the bot was watching: that token is marked incomplete and never counts as a profit.
 
-2. **Promotion from candidates:** Wallets meeting the thresholds (`MIN_BUYS`, `MIN_SELLS`, `MIN_RATIO`) are promoted to auto-watched status.
+2. **Promotion from candidates:** A wallet is promoted when all of these hold:
+   - at least `WALLET_DISCOVERY_MIN_BUYS` buys and `WALLET_DISCOVERY_MIN_SELLS` sells observed;
+   - complete round trips (buy and sell both seen) on at least `WALLET_DISCOVERY_MIN_TOKENS` different tokens (default 3);
+   - more than half of those tokens sold for more than they cost;
+   - SOL sold is at least `WALLET_DISCOVERY_MIN_RATIO` times SOL bought across them;
+   - the wallet has never been seen creating a token. A creator selling into its own buyers looks exactly like a profitable trader.
 
-3. **Promotion from DB scores:** Wallets with score >= 50, win rate >= 55%, and 5+ trades are promoted. Anti-wash filters exclude wallets with suspiciously perfect win rates or round PnL numbers.
+3. **Promotion from DB scores:** Wallets with score >= `MIN_WALLET_SCORE_TO_WATCH`, win rate >= 55%, and 5+ trades are promoted. Scores exist only for wallets the bot has copied, so this mainly keeps the list consistent across restarts. Anti-wash filters exclude wallets with suspiciously perfect win rates.
 
 4. **Demotion:** Auto-discovered wallets with 10+ trades and score below 30 are removed.
 
@@ -843,6 +925,10 @@ The bot can automatically discover and promote profitable wallets for copy tradi
 AUTO_DISCOVER_WALLETS=true
 MAX_AUTO_WALLETS=10
 MIN_WALLET_SCORE_TO_WATCH=50.0
+WALLET_DISCOVERY_MIN_BUYS=2
+WALLET_DISCOVERY_MIN_SELLS=1
+WALLET_DISCOVERY_MIN_RATIO=1.15
+WALLET_DISCOVERY_MIN_TOKENS=3
 ```
 
 Manual wallets (from `COPY_WALLETS`) are never demoted.
@@ -965,15 +1051,18 @@ sqlite3 bot_state.db "SELECT COUNT(*) FROM creator_blacklist;"
 
 Used for buying and selling tokens still on the pump.fun bonding curve.
 
-- **Lightning mode (recommended):** PumpPortal builds and signs via their API — no RPC needed
+- **Lightning mode:** PumpPortal builds, signs and sends via their API. The API key's wallet must be the same wallet as `WALLET_PRIVATE_KEY`; if the first Lightning transaction shows a different wallet, Lightning is disabled and a critical alert is sent.
 - **Local mode:** Bot builds transaction, signs with keypair, sends via RPC
 - **Fallback chain:** Lightning → Jito bundle → primary RPC → fallback RPC
-- **Retry logic:** 3 attempts with 1.5s, 3s, 4.5s delays
-- **Confirmation:** Polls `getSignatureStatuses` every 0.4s for up to 15 seconds
+- **Confirmation:** Every signature, Lightning or local, is confirmed with `getSignatureStatuses` before a position is opened or closed
 
-When a PumpPortal API key is configured, Lightning mode is tried first. If it fails, the bot automatically falls back to local transaction signing via RPC. This ensures trades land even when one execution path is down.
+**Trade outcomes.** A trade is `confirmed`, `failed` or `unknown`. `unknown` means the bot cannot tell (RPC down, or a request timed out after being sent), and it is never treated as a failure or a success:
 
-### Jupiter V6 (Graduated Tokens)
+- A buy is re-sent only after a definite failure. After a timeout the same signature is watched until its blockhash expires (about 90 seconds), and the wallet balance decides.
+- A Lightning request that timed out or returned no signature is not followed by a local buy, because the first one may still land.
+- Partial sells are never re-sent on timeout (selling 50% twice sells 75%). Full sells may be re-sent.
+
+### Jupiter (Graduated Tokens)
 
 Used for buying and selling tokens that have graduated to PumpSwap or Raydium.
 
@@ -1001,7 +1090,7 @@ This provides faster transaction inclusion and front-running protection.
 
 The bot automatically selects the execution venue:
 - **Not graduated:** PumpPortal (Lightning → local RPC)
-- **Graduated:** Jupiter V6 (Jito → primary RPC → fallback RPC)
+- **Graduated:** Jupiter (Jito → primary RPC → fallback RPC)
 
 Graduation status is checked on-chain and cached per position.
 
@@ -1068,15 +1157,19 @@ id, strategy, consecutive_losses, last_loss_time, cooldown_until
 8. Run in paper mode for 3-7 days
 9. Review performance in database before going live
 
+Paper results include modelled fees and slippage (Section 4.4) but not failed transactions or competition from faster bots, so expect live results to be worse.
+
 ### Going Live
 
 1. Confirm paper trading results are acceptable
 2. Fund a dedicated wallet with 1-2 SOL
 3. Set conservative limits: `MAX_BUY_SOL=0.05`, `DAILY_LOSS_LIMIT_SOL=0.3`
 4. Set `TRADING_MODE=live`
-5. Run with `python main.py --live`
-6. Monitor closely for the first few hours
-7. Scale up gradually after demonstrating profitability
+5. Use a new database file for live trading (`--db live.db`); the bot will not start on a database holding open paper positions
+6. Check the startup log line `Fixed fees for <strategy>` and make sure fees are a small share of your position size
+7. Run with `python main.py --live`
+8. Monitor closely for the first few hours
+9. Scale up gradually after demonstrating profitability
 
 ### Database Maintenance
 
@@ -1114,6 +1207,13 @@ sqlite3 bot_state.db "DELETE FROM trades; DELETE FROM wallet_scores; DELETE FROM
 | "Max positions" | Position limit reached | Wait for exits or increase limit |
 | "Loss cooldown" | Strategy paused after losses | Wait for cooldown (max 5 min) |
 | "Safety FAIL" on all tokens | On-chain checks blocking | Expected -- most meme coins are unsafe |
+| "Safety SKIP" on all tokens | RPC cannot serve the on-chain reads | Use a better RPC, or set `SAFETY_FAIL_CLOSED=false` to trade without them |
+| "2PT-WAIT" then nothing | Token passed scoring once but did not keep growing | Expected -- the signal needs growth across two pipeline cycles |
+| "POST-GRAD: ... not a fresh graduate" | DEX pool older than `GRAD_MAX_POOL_AGE_MIN` | Expected -- the token graduated long ago |
+| "POST-GRAD: ... only N trades in 5m" | No real trade data yet on DexScreener | The bot waits up to 5 minutes after graduation |
+| "Copy trade events received: 0" | Wallets idle, the RPC poll is failing, or the trade feed is refused | Check `Wallet RPC polls: N ok, M failed` and `Trade feed:` in the status report |
+| "PumpPortal refused the trade subscriptions" | `PUMPPORTAL_TRADE_FEED` is off, no `PUMPPORTAL_API_KEY`, or its wallet holds under 0.02 SOL | Turn the feed on with a funded key (Section 4.3, billed per event), or accept the reduced feature set |
+| "Startup refused" | Database holds positions from the other mode | Use a separate file with `--db` |
 | No signals at all | Filters too strict or quiet market | Lower growth thresholds via Telegram Settings |
 | `[NOTIFY-ONLY]` prefix | Bot is in notify-only mode | Set `NOTIFY_ONLY=false` or Resume via Telegram |
 | All Stage 3 filtered `low_growth` | Growth/rate thresholds too high | Lower via Settings -> Growth and Rate |
@@ -1122,8 +1222,9 @@ sqlite3 bot_state.db "DELETE FROM trades; DELETE FROM wallet_scores; DELETE FROM
 
 | Error | Resolution |
 |-------|------------|
-| "Buy FAILED after 3 attempts" | Increase `SLIPPAGE_PCT` or `PRIORITY_FEE_SOL` |
-| "Sell FAILED" | Token may be a honeypot; try selling manually on pump.fun |
+| Buy fails repeatedly | Increase `SLIPPAGE_PCT`, or raise `MAX_FEE_PCT_OF_TRADE` / `PRIORITY_FEE_SOL` |
+| "Sell FAILED" / "UNSOLD" alert | Token may be a honeypot; the position stays open and is retried. Try selling manually on pump.fun |
+| "Priority fee capped at ..." | Informational: `MAX_FEE_PCT_OF_TRADE` reduced the fee for a small trade |
 | "Tx confirmation timeout" | RPC too slow; upgrade to Helius or QuickNode |
 | "Balance error: SolanaRpcException" | RPC rate limited or down; bot uses cached balance as fallback |
 
@@ -1134,7 +1235,7 @@ sqlite3 bot_state.db "DELETE FROM trades; DELETE FROM wallet_scores; DELETE FROM
 | Sniper losing money | Disable sniper: use `copy_trade,graduation` |
 | Copy trading losing | Check wallet scores; remove wallets below 30 |
 | Creator rugs on every token | Increase `MAX_CREATOR_TX_COUNT` filter, reduce `MAX_TOP_HOLDER_PCT` |
-| Fees eating profits | Increase `MAX_BUY_SOL` (minimum 0.05 to offset fees) |
+| Fees eating profits | Check the `Fixed fees for <strategy>` line at startup. Lower `PRIORITY_FEE_SOL` or `MAX_FEE_PCT_OF_TRADE`, or raise the per-strategy position caps |
 
 ---
 
