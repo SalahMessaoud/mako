@@ -10,14 +10,16 @@ from dataclasses import asdict
 
 log = logging.getLogger(__name__)
 
-DB_PATH = os.getenv("BOT_DB_PATH", "bot_state.db")
+DEFAULT_DB_PATH = "bot_state.db"
 
 
 class Database:
     """SQLite persistence for bot state. Zero cost, zero dependencies."""
 
-    def __init__(self, path: str = DB_PATH):
-        self.path = path
+    def __init__(self, path: str | None = None):
+        # Resolved at construction, not import, so --db actually takes effect.
+        self.path = path or os.getenv("BOT_DB_PATH", DEFAULT_DB_PATH)
+        path = self.path
         self._lock = threading.Lock()
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -203,14 +205,36 @@ class Database:
             "win_rate": (wins / total * 100) if total > 0 else 0,
         }
 
+    @staticmethod
+    def _today_start() -> float:
+        """Local midnight — the same day boundary the bot's daily reset uses."""
+        import datetime
+        midnight = datetime.datetime.combine(datetime.date.today(), datetime.time.min)
+        return midnight.timestamp()
+
     def get_daily_pnl(self) -> float:
         """Get today's total PnL."""
-        today_start = time.time() - (time.time() % 86400)
         row = self.conn.execute(
             "SELECT SUM(pnl_sol) FROM trades WHERE action='sell' AND timestamp > ?",
-            (today_start,)
+            (self._today_start(),)
         ).fetchone()
         return row[0] or 0.0
+
+    def count_buys_today(self) -> int:
+        """Buys opened today — restores the daily trade cap after a restart."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE action='buy' AND timestamp > ?",
+            (self._today_start(),)
+        ).fetchone()
+        return row[0] or 0
+
+    def get_recently_closed_mints(self, hours: int = 24) -> set[str]:
+        """Mints fully sold recently — restores no-re-entry after a restart."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT mint FROM trades WHERE action='sell' AND timestamp > ?",
+            (time.time() - hours * 3600,)
+        ).fetchall()
+        return {r[0] for r in rows}
 
     # ── Wallet Scoring ────────────────────────────────────────
 

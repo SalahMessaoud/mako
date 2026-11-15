@@ -14,15 +14,25 @@ from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.hash import Hash
 from solders.message import MessageV0
-from solders.commitment_config import CommitmentLevel
-from solders.rpc.requests import SendVersionedTransaction
-from solders.rpc.config import RpcSendTransactionConfig
+from dataclasses import dataclass
 from config import (
     PUMPPORTAL_TRADE_URL, PUMPPORTAL_LIGHTNING_URL,
     PUMPPORTAL_WS_URL, JITO_BUNDLE_URL,
 )
+from txutil import (
+    TradeResult, CONFIRMED, FAILED, UNKNOWN, PENDING, BLOCKHASH_EXPIRY_SEC,
+    confirm_signature, send_signed_tx, get_tx_result,
+)
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _Sent:
+    """Result of submitting one trade request."""
+    sig: str = ""
+    via_lightning: bool = False
+    ambiguous: bool = False   # submitted-or-not is unknown (timeout after send)
 
 
 class PumpPortal:
@@ -36,7 +46,7 @@ class PumpPortal:
     """
 
     MAX_RETRIES = 3
-    CONFIRM_TIMEOUT = 15       # seconds to wait for confirmation
+    BUY_MAX_WAIT = BLOCKHASH_EXPIRY_SEC  # watch a buy until it can no longer land
     SELL_CONFIRM_TIMEOUT = 15  # seconds for sells
     RETRY_DELAY = 1.5     # seconds between retries
 
@@ -74,166 +84,167 @@ class PumpPortal:
     # ── Trading with Retry ────────────────────────────────────
 
     async def buy(self, mint: str, sol_amount: float, slippage: int = 15,
-                  priority_fee: float = 0.005, pool: str = "auto") -> str | None:
-        """Buy with retry logic. Returns confirmed tx signature or None."""
+                  priority_fee: float = 0.005, pool: str = "auto") -> TradeResult:
+        """Buy. Returns a TradeResult (confirmed / failed / unknown).
+
+        A buy is only re-sent after a DEFINITE failure (rejected, or an
+        on-chain error). After a timeout we keep watching the same signature
+        until its blockhash expires — sending a second transaction while the
+        first may still land would buy twice.
+        """
+        sigs: list[str] = []
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                sig = await self._execute_trade(
+                sent = await self._execute_trade(
                     "buy", mint, sol_amount, denominated_in_sol=True,
                     slippage=slippage, priority_fee=priority_fee, pool=pool,
                 )
-                if sig:
-                    confirmed = await self._confirm_tx(sig, fixed_interval=True)
-                    if confirmed:
-                        self._record_tx("buy", mint, sol_amount, sig, True)
-                        return sig
-                    else:
-                        log.warning(f"  Buy tx not confirmed (attempt {attempt}): {sig}")
-                        self._record_tx("buy", mint, sol_amount, sig, False)
-                else:
-                    log.warning(f"  Buy failed (attempt {attempt}/{self.MAX_RETRIES})")
-
             except Exception as e:
-                log.error(f"  Buy error (attempt {attempt}): {e}")
+                log.error(f"  Buy error (attempt {attempt}): {self._redact(e)}")
+                sent = _Sent()
+
+            if sent.sig:
+                sigs.append(sent.sig)
+                status = await confirm_signature(
+                    self.http, self._rpc_urls, sent.sig,
+                    timeout=self.BUY_MAX_WAIT,
+                )
+                self._record_tx("buy", mint, sol_amount, sent.sig,
+                                status == CONFIRMED)
+                if status == CONFIRMED:
+                    return TradeResult(CONFIRMED, sent.sig, sent.via_lightning, sigs)
+                if status == UNKNOWN:
+                    log.warning(f"  Buy outcome unknown (RPC unreachable): {sent.sig[:16]}...")
+                    return TradeResult(UNKNOWN, sent.sig, sent.via_lightning, sigs)
+                if status == PENDING:
+                    # Never seen within the blockhash lifetime — it expired.
+                    # The signal is stale by now; do not chase it.
+                    log.warning(f"  Buy tx expired without landing: {sent.sig[:16]}...")
+                    return TradeResult(FAILED, sent.sig, sent.via_lightning, sigs)
+                log.warning(f"  Buy tx failed on-chain (attempt {attempt}): {sent.sig[:16]}...")
+            elif sent.ambiguous:
+                # The request may have been submitted but we got no signature.
+                log.warning("  Buy outcome unknown (no response after submit)")
+                return TradeResult(UNKNOWN, "", sent.via_lightning, sigs)
+            else:
+                log.warning(f"  Buy rejected (attempt {attempt}/{self.MAX_RETRIES})")
 
             if attempt < self.MAX_RETRIES:
                 await asyncio.sleep(self.RETRY_DELAY * attempt)
 
         log.error(f"  Buy FAILED after {self.MAX_RETRIES} attempts: {mint[:16]}")
-        return None
+        return TradeResult(FAILED, "", False, sigs)
 
     async def sell(self, mint: str, token_amount: float = None,
                    sell_pct: int = 100, slippage: int = 15,
                    priority_fee: float = 0.005, pool: str = "auto",
-                   skip_jito: bool = False) -> str | None:
-        """Sell with retry logic. Returns confirmed tx signature or None."""
-        if token_amount is not None:
-            amount = token_amount
-            denom_sol = False
-        else:
-            amount = f"{sell_pct}%"
-            denom_sol = False
+                   skip_jito: bool = False,
+                   resend_on_timeout: bool = True) -> TradeResult:
+        """Sell. Returns a TradeResult (confirmed / failed / unknown).
+
+        `resend_on_timeout` must be False for partial sells: selling "50%"
+        twice sells 75%. A full sell is safe to re-send — if the first one
+        landed, the second simply fails.
+        """
+        amount = token_amount if token_amount is not None else f"{sell_pct}%"
+        sigs: list[str] = []
+        undecided = False
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                sig = await self._execute_trade(
-                    "sell", mint, amount, denominated_in_sol=denom_sol,
+                sent = await self._execute_trade(
+                    "sell", mint, amount, denominated_in_sol=False,
                     slippage=slippage, priority_fee=priority_fee, pool=pool,
                     skip_jito=skip_jito,
+                    allow_fallback_when_ambiguous=resend_on_timeout,
                 )
-                if sig:
-                    confirmed = await self._confirm_tx(
-                        sig, timeout=self.SELL_CONFIRM_TIMEOUT,
-                        fixed_interval=True,
-                    )
-                    if confirmed:
-                        self._record_tx("sell", mint, 0, sig, True)
-                        return sig
-                    else:
-                        log.warning(f"  Sell tx not confirmed (attempt {attempt}): {sig}")
-                        self._record_tx("sell", mint, 0, sig, False)
-                else:
-                    log.warning(f"  Sell failed (attempt {attempt}/{self.MAX_RETRIES})")
-
             except Exception as e:
-                log.error(f"  Sell error (attempt {attempt}): {e}")
+                log.error(f"  Sell error (attempt {attempt}): {self._redact(e)}")
+                sent = _Sent()
+
+            if sent.sig:
+                sigs.append(sent.sig)
+                status = await confirm_signature(
+                    self.http, self._rpc_urls, sent.sig,
+                    timeout=self.SELL_CONFIRM_TIMEOUT,
+                )
+                self._record_tx("sell", mint, 0, sent.sig, status == CONFIRMED)
+                if status == CONFIRMED:
+                    return TradeResult(CONFIRMED, sent.sig, sent.via_lightning, sigs)
+                if status in (PENDING, UNKNOWN):
+                    undecided = True
+                    log.warning(f"  Sell tx not confirmed (attempt {attempt}): {sent.sig[:16]}...")
+                    if not resend_on_timeout:
+                        return TradeResult(UNKNOWN, sent.sig, sent.via_lightning, sigs)
+                else:
+                    log.warning(f"  Sell tx failed on-chain (attempt {attempt}): {sent.sig[:16]}...")
+            elif sent.ambiguous:
+                undecided = True
+                log.warning("  Sell outcome unknown (no response after submit)")
+                if not resend_on_timeout:
+                    return TradeResult(UNKNOWN, "", sent.via_lightning, sigs)
+            else:
+                log.warning(f"  Sell rejected (attempt {attempt}/{self.MAX_RETRIES})")
 
             if attempt < self.MAX_RETRIES:
                 await asyncio.sleep(self.RETRY_DELAY * attempt)
 
-        log.error(f"  Sell FAILED after {self.MAX_RETRIES} attempts: {mint[:16]}")
-        return None
+        # An earlier attempt may have landed while we were sending later ones.
+        for sig in sigs:
+            if await confirm_signature(self.http, self._rpc_urls, sig,
+                                       timeout=0) == CONFIRMED:
+                return TradeResult(CONFIRMED, sig, False, sigs)
 
-    # ── Transaction Confirmation ──────────────────────────────
+        log.error(f"  Sell not confirmed after {self.MAX_RETRIES} attempts: {mint[:16]}")
+        return TradeResult(UNKNOWN if undecided else FAILED, "", False, sigs)
 
-    async def _confirm_tx(self, signature: str, timeout: int = None,
-                          fixed_interval: bool = False) -> bool:
-        """Wait for transaction confirmation. Non-blocking."""
-        timeout = timeout or self.CONFIRM_TIMEOUT
-        start = time.time()
-        poll_interval = 0.4 if fixed_interval else 0.5
+    # ── Transaction lookup ────────────────────────────────────
 
-        while time.time() - start < timeout:
-            for rpc_url in self._rpc_urls:
-                try:
-                    resp = await self.http.post(rpc_url, json={
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "getSignatureStatuses",
-                        "params": [[signature], {"searchTransactionHistory": False}],
-                    })
-                    data = resp.json()
-                    result = data.get("result", {})
-                    value = result.get("value", [None])[0]
-
-                    if value:
-                        status = value.get("confirmationStatus", "")
-                        err = value.get("err")
-
-                        if err:
-                            log.warning(f"  Tx failed on-chain: {err}")
-                            return False
-
-                        if status in ("confirmed", "finalized"):
-                            elapsed = time.time() - start
-                            log.info(f"  Tx confirmed ({status}) in {elapsed:.1f}s: {signature[:16]}...")
-                            return True
-                    break  # got a valid response, no need to try fallback
-                except Exception as e:
-                    log.debug(f"  Confirm poll error ({rpc_url[:30]}): {e}")
-
-            await asyncio.sleep(poll_interval)
-            if not fixed_interval:
-                poll_interval = min(poll_interval * 1.5, 3.0)
-
-        log.warning(f"  Tx confirmation timeout ({timeout}s): {signature[:16]}...")
-        return False
-
-    async def get_tx_result(self, signature: str) -> dict | None:
+    async def get_tx_result(self, signature: str, retries: int = 1) -> dict | None:
         """Get full transaction result (for balance change calculation)."""
-        for rpc_url in self._rpc_urls:
-            try:
-                resp = await self.http.post(rpc_url, json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getTransaction",
-                    "params": [signature, {
-                        "encoding": "jsonParsed",
-                        "commitment": "confirmed",
-                        "maxSupportedTransactionVersion": 0,
-                    }],
-                })
-                data = resp.json()
-                result = data.get("result")
-                if result:
-                    return result
-            except Exception as e:
-                log.debug(f"  Get tx error ({rpc_url[:30]}): {e}")
-        return None
+        return await get_tx_result(self.http, self._rpc_urls, signature,
+                                   retries=retries)
 
     # ── Trade Execution ───────────────────────────────────────
+
+    def _redact(self, value) -> str:
+        """Stringify for logging with the API key removed (it rides in a URL)."""
+        text = f"{type(value).__name__}: {value}" if isinstance(value, Exception) else str(value)
+        if self.api_key:
+            text = text.replace(self.api_key, "***")
+        return text
 
     async def _execute_trade(self, action: str, mint: str, amount,
                              denominated_in_sol: bool, slippage: int,
                              priority_fee: float, pool: str,
-                             skip_jito: bool = False) -> str | None:
-        # Try Lightning first (server-side, no RPC needed), fall back to local
+                             skip_jito: bool = False,
+                             allow_fallback_when_ambiguous: bool = False) -> "_Sent":
+        """Submit one trade. Lightning first (server-side), then local signing.
+
+        Falls back from Lightning to local ONLY when Lightning clearly did not
+        submit anything. If the Lightning request timed out after being sent,
+        the trade may be in flight, and a local send would duplicate it.
+        """
         if self.api_key:
-            sig = await self._lightning_trade(action, mint, amount,
-                                              denominated_in_sol, slippage,
-                                              priority_fee, pool)
-            if sig:
-                return sig
+            sent = await self._lightning_trade(action, mint, amount,
+                                               denominated_in_sol, slippage,
+                                               priority_fee, pool)
+            if sent.sig:
+                return sent
+            if sent.ambiguous and not allow_fallback_when_ambiguous:
+                return sent
             if self.keypair:
                 log.warning(f"  Lightning {action} failed, falling back to local RPC")
 
         if self.keypair:
             return await self._local_trade(action, mint, amount,
-                                            denominated_in_sol, slippage,
-                                            priority_fee, pool,
-                                            skip_jito=skip_jito)
-        return None
+                                           denominated_in_sol, slippage,
+                                           priority_fee, pool,
+                                           skip_jito=skip_jito)
+        return _Sent()
 
     async def _lightning_trade(self, action, mint, amount, denom_sol,
-                               slippage, priority_fee, pool) -> str | None:
+                               slippage, priority_fee, pool) -> "_Sent":
         try:
             resp = await self.http.post(
                 f"{PUMPPORTAL_LIGHTNING_URL}?api-key={self.api_key}",
@@ -244,20 +255,41 @@ class PumpPortal:
                     "pool": pool,
                 },
             )
-            if resp.status_code == 200:
-                return resp.json().get("signature", "")
-            log.error(f"Lightning {action}: {resp.status_code} {resp.text[:100]}")
-            return None
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Never reached the server — nothing was submitted.
+            log.error(f"Lightning connect error: {self._redact(e)}")
+            return _Sent(via_lightning=True)
         except Exception as e:
-            log.error(f"Lightning error: {e}")
-            return None
+            # Sent, but no answer: the trade may or may not have been placed.
+            log.error(f"Lightning error after submit: {self._redact(e)}")
+            return _Sent(via_lightning=True, ambiguous=True)
+
+        if resp.status_code >= 500:
+            # Server-side failure mid-request: cannot tell if it was placed.
+            log.error(f"Lightning {action}: {resp.status_code} {resp.text[:100]}")
+            return _Sent(via_lightning=True, ambiguous=True)
+        if resp.status_code != 200:
+            log.error(f"Lightning {action}: {resp.status_code} {resp.text[:100]}")
+            return _Sent(via_lightning=True)
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        sig = (body.get("signature") or "") if isinstance(body, dict) else ""
+        if sig:
+            return _Sent(sig=sig, via_lightning=True)
+        # A 200 without a signature is a clean rejection ONLY if the body
+        # says so. Otherwise we cannot tell whether a trade was placed.
+        rejected = isinstance(body, dict) and bool(body.get("errors") or body.get("error"))
+        log.error(f"Lightning {action}: no signature in response: {resp.text[:100]}")
+        return _Sent(via_lightning=True, ambiguous=not rejected)
 
     async def _local_trade(self, action, mint, amount, denom_sol,
                             slippage, priority_fee, pool,
-                            skip_jito: bool = False) -> str | None:
+                            skip_jito: bool = False) -> "_Sent":
         if not self.keypair:
             log.error("No keypair for local trade")
-            return None
+            return _Sent()
         try:
             resp = await self.http.post(PUMPPORTAL_TRADE_URL, data={
                 "publicKey": str(self.keypair.pubkey()),
@@ -268,48 +300,38 @@ class PumpPortal:
             })
             if resp.status_code != 200:
                 log.error(f"Local trade: {resp.status_code} {resp.text[:100]}")
-                return None
+                return _Sent()
 
-            tx_bytes = resp.content
             tx = VersionedTransaction(
-                VersionedTransaction.from_bytes(tx_bytes).message,
+                VersionedTransaction.from_bytes(resp.content).message,
                 [self.keypair],
             )
-
-            # Try Jito bundle if enabled (skip for emergency sells)
-            if self.use_jito and not skip_jito:
-                try:
-                    sig = await self._send_jito_bundle(tx)
-                    if sig:
-                        log.info(f"  Jito bundle sent: {sig[:16]}...")
-                        return sig
-                    log.warning("  Jito bundle failed, falling back to direct RPC")
-                except Exception as e:
-                    log.warning(f"  Jito error: {e}, falling back to direct RPC")
-
-            # Direct RPC send (default or Jito fallback)
-            send_cfg = RpcSendTransactionConfig(
-                skip_preflight=True,
-                preflight_commitment=CommitmentLevel.Confirmed,
-                max_retries=3,
-            )
-            send_req = SendVersionedTransaction(tx, send_cfg)
-            for rpc_url in self._rpc_urls:
-                try:
-                    rpc_resp = await self.http.post(
-                        rpc_url, content=send_req.to_json(),
-                        headers={"Content-Type": "application/json"},
-                    )
-                    rpc_data = rpc_resp.json()
-                    if "result" in rpc_data:
-                        return rpc_data["result"]
-                    log.warning(f"RPC send ({rpc_url[:30]}): {rpc_data.get('error', rpc_data)}")
-                except Exception as e:
-                    log.warning(f"RPC send error ({rpc_url[:30]}): {e}")
-            return None
         except Exception as e:
-            log.error(f"Local trade error: {e}")
-            return None
+            # Nothing has been signed or sent yet — a clean failure.
+            log.error(f"Local trade build error: {self._redact(e)}")
+            return _Sent()
+
+        # From here the transaction is signed: its signature is known, and
+        # every send below submits the SAME transaction (idempotent).
+        sig = str(tx.signatures[0])
+
+        # Try Jito bundle if enabled (skip for emergency sells)
+        if self.use_jito and not skip_jito:
+            try:
+                if await self._send_jito_bundle(tx):
+                    log.info(f"  Jito bundle sent: {sig[:16]}...")
+                    return _Sent(sig=sig)
+                log.warning("  Jito bundle failed, falling back to direct RPC")
+            except Exception as e:
+                log.warning(f"  Jito error: {type(e).__name__}, falling back to direct RPC")
+
+        # Direct RPC send (default or Jito fallback)
+        _sig, accepted = await send_signed_tx(self.http, self._rpc_urls, tx)
+        if accepted is False:
+            return _Sent()            # every RPC explicitly rejected it
+        # Accepted, or ambiguous (a send timed out): either way the signature
+        # is what we watch — confirmation decides the outcome.
+        return _Sent(sig=sig)
 
     # ── Jito Bundle Support ────────────────────────────────────
 

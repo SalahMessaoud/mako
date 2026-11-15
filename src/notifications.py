@@ -1,6 +1,7 @@
 """Telegram notifications for trade alerts."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 log = logging.getLogger(__name__)
@@ -17,6 +18,10 @@ class Notifier:
         self.enabled = bool(bot_token and chat_id)
         self.http = httpx.Client(timeout=5)
         self._update_offset = 0
+        # Alerts are sent from a single background thread so a slow Telegram
+        # call can never stall the trading event loop. One worker keeps
+        # messages in order.
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="notify")
         if self.enabled:
             log.info("📱 Telegram notifications enabled")
 
@@ -25,9 +30,15 @@ class Notifier:
         self.send_to(self.chat_id, message)
 
     def send_to(self, chat_id: str, message: str):
-        """Send a message to a specific chat_id."""
+        """Queue a message to a specific chat_id (non-blocking)."""
         if not self.enabled:
             return
+        try:
+            self._pool.submit(self._send_now, chat_id, message)
+        except RuntimeError:
+            self._send_now(chat_id, message)  # pool already shut down
+
+    def _send_now(self, chat_id: str, message: str):
         try:
             resp = self.http.post(
                 TELEGRAM_API.format(token=self.token, method="sendMessage"),
@@ -217,4 +228,5 @@ class Notifier:
         self.send(msg)
 
     def close(self):
+        self._pool.shutdown(wait=True)  # flush queued alerts
         self.http.close()

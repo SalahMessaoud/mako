@@ -16,6 +16,9 @@ class SafetyResult:
     warnings: list[str]
     details: dict
     onchain: OnChainResult = None
+    # True when on-chain data could not be read. The token is not known to be
+    # bad — callers should skip the trade but must NOT blacklist it.
+    unverified: bool = False
 
     def __str__(self):
         s = "PASS" if self.passed else "FAIL"
@@ -62,6 +65,7 @@ class SafetyChecker:
 
         # Layer 2: On-chain
         onchain_result = None
+        onchain_failed = False
         if self.onchain:
             try:
                 onchain_result = await self.onchain.analyze(token.mint, creator)
@@ -74,6 +78,8 @@ class SafetyChecker:
             except Exception as e:
                 log.debug(f"On-chain check failed: {e}")
                 scores["onchain"] = 50
+                onchain_result = None
+                onchain_failed = True
 
         # Weighted score
         if "onchain" in scores:
@@ -98,8 +104,23 @@ class SafetyChecker:
             if onchain_result and not onchain_result.freeze_authority_revoked:
                 passed = False
 
+        # Fail closed: if the on-chain layer could not be read, the freeze
+        # authority and holder checks above ran on default values and prove
+        # nothing. Skip the trade without condemning the token.
+        unverified = False
+        if self.onchain and getattr(self.cfg, "safety_fail_closed", True):
+            if onchain_failed or (onchain_result and not onchain_result.verified):
+                unverified = True
+                passed = False
+                warnings.insert(0, "On-chain data unavailable")
+        elif onchain_result and not onchain_result.mint_read_ok:
+            # Fail-open mode: an unreadable mint must not look like an active
+            # freeze authority.
+            unverified = True
+
         return SafetyResult(passed=passed, score=final, warnings=warnings,
-                            details=scores, onchain=onchain_result)
+                            details=scores, onchain=onchain_result,
+                            unverified=unverified)
 
     def _score_liquidity(self, t): return 100 if t.liquidity_usd >= 100_000 else 85 if t.liquidity_usd >= 50_000 else 65 if t.liquidity_usd >= 20_000 else 50 if t.liquidity_usd >= 10_000 else 30 if t.liquidity_usd >= 5_000 else 10
     def _score_age(self, t, snipe):

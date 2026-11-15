@@ -46,7 +46,12 @@ class Wallet:
                 log.error(f"Balance error: {type(e).__name__}: {e}")
         return self._cached_balance
 
-    def get_token_balance(self, mint: str) -> float:
+    def get_token_amount(self, mint: str) -> tuple[float, int, int] | None:
+        """Return (ui_amount, raw_amount, decimals) for a mint.
+
+        None means every RPC failed — the balance is UNKNOWN, not zero.
+        (0.0, 0, decimals) means an RPC answered and there are no tokens.
+        """
         for client in [self.client, self._fallback_client]:
             if not client:
                 continue
@@ -55,14 +60,21 @@ class Wallet:
                     Pubkey.from_string(self.pubkey),
                     TokenAccountOpts(mint=Pubkey.from_string(mint)),
                 )
-                if resp.value:
-                    for acct in resp.value:
-                        info = acct.account.data.parsed["info"]
-                        return float(info["tokenAmount"]["uiAmount"] or 0)
-                return 0.0
+                raw_total = 0
+                decimals = 6
+                for acct in resp.value or []:
+                    amount = acct.account.data.parsed["info"]["tokenAmount"]
+                    raw_total += int(amount["amount"])
+                    decimals = int(amount["decimals"])
+                return raw_total / (10 ** decimals), raw_total, decimals
             except Exception as e:
-                log.error(f"Token balance error: {e}")
-        return 0.0
+                log.error(f"Token balance error: {type(e).__name__}: {e}")
+        return None  # All RPCs failed — caller must not assume 0
+
+    def get_token_balance(self, mint: str) -> float | None:
+        """Return token balance, or None if all RPCs failed."""
+        amount = self.get_token_amount(mint)
+        return amount[0] if amount is not None else None
 
 
 @dataclass
@@ -94,6 +106,10 @@ class PaperWallet:
     def get_token_balance(self, mint: str) -> float:
         pos = self.positions.get(mint)
         return pos.tokens if pos else 0.0
+
+    def get_token_amount(self, mint: str) -> tuple[float, int, int]:
+        tokens = self.get_token_balance(mint)
+        return tokens, int(tokens * 1e6), 6
 
     def buy(self, mint: str, symbol: str, sol_amount: float,
             tokens: float, price_usd: float) -> bool:

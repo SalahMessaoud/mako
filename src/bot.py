@@ -22,6 +22,7 @@ from strategies import (
 )
 from notifications import Notifier
 from telegram_ui import TelegramUI
+from txutil import TradeResult, parse_tx_outcome
 
 log = logging.getLogger(__name__)
 
@@ -182,12 +183,40 @@ class MemeBot:
     - Wallet scoring for copy targets
     """
 
-    def __init__(self, config: Config):
+    # Timing knobs for on-chain verification (class attributes so tests can
+    # shorten them).
+    ZERO_RECHECK_DELAY = 2.0          # gap before re-reading a zero balance
+    ZERO_CLOSE_MIN_AGE_SEC = 30       # never trust a zero read sooner after a buy
+    RECONCILE_GRACE_SEC = 120         # how long a buy may stay tokenless
+    PARTIAL_HOLD_SEC = 90             # blockhash lifetime: an unknown tx can land until then
+    SELL_BALANCE_POLLS = 3            # balance reads after an unconfirmed sell
+    SELL_BACKOFF_SEC = 30             # pause between sell attempts after a failure
+    SELL_BACKOFF_LONG_SEC = 300       # pause once STUCK_BACKOFF_AFTER attempts failed
+    STUCK_BACKOFF_AFTER = 10
+    BUY_BALANCE_POLLS_CONFIRMED = (6, 1.5)   # (tries, pause) after a confirmed buy
+    BUY_BALANCE_POLLS_UNKNOWN = (6, 2.0)     # unknown outcome, signature known
+    BUY_BALANCE_POLLS_NO_SIG = (30, 3.0)     # unknown outcome, no signature
+
+    def __init__(self, config: Config, db_path: str | None = None):
         self.cfg = config
         self.running = False
 
         # Database (crash recovery)
-        self.db = Database()
+        self.db = Database(db_path)
+
+        # Paper and live must never share a database: a paper run would
+        # "sell" recovered live positions on paper and delete their rows.
+        mode = "paper" if config.paper_trading else "live"
+        stored_mode = self.db.get_state("trading_mode")
+        if stored_mode and stored_mode != mode and self.db.position_count() > 0:
+            open_count = self.db.position_count()
+            self.db.close()
+            raise RuntimeError(
+                f"database {self.db.path} holds {open_count} open "
+                f"{stored_mode} position(s) but this run is {mode}. "
+                f"Use a separate file with --db."
+            )
+        self.db.set_state("trading_mode", mode)
 
         # Core systems
         self.market = MarketData()
@@ -310,8 +339,33 @@ class MemeBot:
         self._buyer_subs: dict[str, float] = {}  # mint -> expiry timestamp
         self._buyer_sub_max = 50  # max concurrent buyer tracking subs
 
-        # Permanent no-re-entry set (populated when positions close)
-        self._closed_mints: set[str] = set()
+        # No-re-entry set (populated when positions close; reloaded from the
+        # trade log so a restart does not re-open tokens traded today)
+        self._closed_mints: set[str] = self.db.get_recently_closed_mints(hours=24)
+
+        # Sells that could not be completed: mint -> failed attempt count.
+        # These positions are KEPT and retried — never written off.
+        self._stuck_positions: dict[str, int] = {}
+        self._stuck_alerted: set[str] = set()
+        # mint -> (no automatic sell before this time, failed attempt was an emergency)
+        self._sell_backoff: dict[str, tuple[float, bool]] = {}
+
+        # Signatures of sell attempts whose outcome was not confirmed. If the
+        # tokens later turn out to be gone, these tell us what was received.
+        self._sell_sigs: dict[str, list[str]] = {}
+
+        # Mints with a sell currently in flight (prevents stacking sells)
+        self._selling: dict[str, int] = {}   # mint -> largest sell % in flight
+
+        # Partial sells with an unknown outcome: no new partial until resolved
+        self._partial_hold: dict[str, dict] = {}
+
+        # Buys approved by the risk check but not yet opened: mint -> SOL.
+        # Counted against the caps so concurrent buys cannot overshoot them.
+        self._reserved: dict[str, float] = {}
+
+        # Background trade tasks (kept referenced so they are not GC'd)
+        self._bg_tasks: set[asyncio.Task] = set()
 
         # Crash recovery
         recovered = self.risk.recover_positions()
@@ -322,7 +376,16 @@ class MemeBot:
                 to_remove = []
                 for mint, pos in list(self.risk.positions.items()):
                     balance = self.wallet.get_token_balance(mint)
+                    if balance is None:
+                        log.warning(f"  Recovered {pos.symbol} balance check failed (RPC error) — keeping")
+                        continue
                     if balance <= 0:
+                        # Confirm with a second read before dropping anything
+                        time.sleep(1)
+                        recheck = self.wallet.get_token_balance(mint)
+                        if recheck is None or recheck > 0:
+                            log.warning(f"  Recovered {pos.symbol} balance unclear — keeping")
+                            continue
                         log.warning(f"  Recovered {pos.symbol} has 0 on-chain balance — removing")
                         to_remove.append(mint)
                     elif pos.tx_signature == "phantom":
@@ -385,10 +448,18 @@ class MemeBot:
         tasks.append(asyncio.create_task(
             self.stream.connect(watch_wallets=watch_wallets)
         ))
+        # Positions recovered from a crash mid-buy have no tokens/price yet
+        try:
+            await self._reconcile_positions(force=True)
+        except Exception as e:
+            log.warning(f"  Startup reconcile error: {e}")
         tasks.append(asyncio.create_task(self._poll_loop()))
         tasks.append(asyncio.create_task(self._fast_position_check()))
         log.info("  All async tasks launched")
+        self._main_tasks = tasks
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        if not self.running:
+            return  # normal shutdown: the tasks were cancelled on purpose
         log.warning("  asyncio.gather returned — all tasks ended!")
         for i, result in enumerate(results):
             if isinstance(result, Exception):
@@ -424,7 +495,7 @@ class MemeBot:
                 if tick % 10 == 0:
                     self.db.set_state("heartbeat", int(time.time()))
                     if not self.cfg.paper_trading:
-                        self.db.set_state("live_balance", self.wallet.get_sol_balance())
+                        self.db.set_state("live_balance", await self._sol_balance())
 
                     # Clean expired discovery subscriptions
                     if self._discovery_subs:
@@ -452,6 +523,11 @@ class MemeBot:
                     expired = [m for m, exp in self._mint_cooldowns.items() if exp <= now]
                     for m in expired:
                         del self._mint_cooldowns[m]
+                    # Drop idle per-mint locks (never one that is held)
+                    for m in [m for m, lk in self._mint_locks.items()
+                              if not lk.locked() and m not in self.risk.positions
+                              and m not in self._reserved and m not in self._selling]:
+                        self._mint_locks.pop(m, None)
 
                 # Day-boundary reset for daily PnL
                 today = datetime.date.today()
@@ -460,29 +536,28 @@ class MemeBot:
                     self.risk.reset_daily()
                     self._last_date = today
 
-                # Retry stuck sells (every ~30s) with escalation
-                if tick % 10 == 0 and hasattr(self, '_stuck_positions') and self._stuck_positions:
+                # Retry stuck sells. A stuck position is NEVER written off:
+                # the tokens are still in the wallet. The pause between
+                # attempts (30s, then 5 min after 10 failures) is enforced in
+                # _spawn_sell for every trigger, not just this loop.
+                if tick % 10 == 0 and self._stuck_positions:
                     for stuck_mint in list(self._stuck_positions.keys()):
-                        if stuck_mint not in self.risk.positions:
-                            self._stuck_positions.pop(stuck_mint, None)
+                        pos = self.risk.positions.get(stuck_mint)
+                        if not pos:
+                            self._clear_stuck(stuck_mint)
                             continue
                         retries = self._stuck_positions.get(stuck_mint, 0)
-                        if retries >= 10:
-                            # Force-close: write off the position to free portfolio space
-                            pos = self.risk.positions.get(stuck_mint)
-                            log.error(f"  FORCE CLOSE: {pos.symbol} after {retries} failed sell retries")
-                            self.risk.close(stuck_mint, 0, "force_close_stuck")
-                            await self._on_position_closed(stuck_mint,
-                                                           strategy=pos.strategy, creator=pos.creator)
-                            self._stuck_positions.pop(stuck_mint, None)
-                            self.notify.send(
-                                f"FORCE CLOSED {pos.symbol} — sell failed {retries} times"
-                            )
-                        else:
-                            log.info(f"  Retrying stuck sell ({retries}/10): {stuck_mint[:16]}...")
-                            await self._execute_sell(stuck_mint, 100, "stuck_retry")
-                            if stuck_mint not in self.risk.positions:
-                                self._stuck_positions.pop(stuck_mint, None)
+                        if retries >= self.STUCK_BACKOFF_AFTER:
+                            if stuck_mint not in self._stuck_alerted:
+                                self._stuck_alerted.add(stuck_mint)
+                                log.error(f"  UNSOLD: {pos.symbol} — {retries} failed sells, "
+                                          f"backing off to one retry every ~5 min")
+                                self.notify.send(
+                                    f"UNSOLD: {pos.symbol} ({stuck_mint[:16]}...) — sell failed "
+                                    f"{retries} times. Still holding the tokens; retrying "
+                                    f"every ~5 min. Manual action may be needed."
+                                )
+                        self._spawn_sell(stuck_mint, 100, "stuck_retry")
 
                 # Rug detection polling (every ~10 ticks / ~30s)
                 if tick % 10 == 0 and hasattr(self, 'rug_detector'):
@@ -503,7 +578,7 @@ class MemeBot:
                                         self.sniper.blacklist_creator(mon.creator)
                                         self.db.blacklist_creator(mon.creator, f"rug: {rug_signal.reason[:80]}")
                                         log.info(f"  Creator {mon.creator[:8]}... blacklisted after rug")
-                                await self._execute_sell(
+                                self._spawn_sell(
                                     rug_signal.mint, rug_signal.sell_pct, rug_signal.reason,
                                 )
                         except Exception as e:
@@ -595,7 +670,22 @@ class MemeBot:
                     pnl_pct = ((price_usd - pos.entry_price) / pos.entry_price) * 100
 
                     # During grace period, only act on catastrophic dumps (>50%)
-                    if in_grace and pnl_pct > -50:
+                    # Require 8s confirmation to avoid acting on a single bad price read
+                    if in_grace:
+                        if pnl_pct > -50:
+                            pos.catastrophic_first_seen = 0.0
+                            continue
+                        now_cat = time.time()
+                        if pos.catastrophic_first_seen == 0.0:
+                            pos.catastrophic_first_seen = now_cat
+                        held = now_cat - pos.catastrophic_first_seen
+                        if held < 8:
+                            continue
+                        # Confirmed for 8s — exit now. Falling through to the
+                        # normal stop-loss block would start a SECOND 8s timer.
+                        log.warning(f"  FAST-EXIT (catastrophic): {pos.symbol} at "
+                                    f"{pnl_pct:+.1f}% during grace (confirmed {held:.0f}s)")
+                        self._spawn_sell(mint, 100, "fast_stop_loss_catastrophic")
                         continue
 
                     # Only act on positions in the danger zone
@@ -623,7 +713,7 @@ class MemeBot:
                         if elapsed >= 8 or pnl_pct <= -(stop * 3):
                             log.warning(f"  FAST-EXIT: {pos.symbol} at {pnl_pct:+.1f}% "
                                         f"(stop={-stop:.0f}%, confirmed {elapsed:.0f}s)")
-                            await self._execute_sell(mint, 100, "fast_stop_loss")
+                            self._spawn_sell(mint, 100, "fast_stop_loss")
                     elif pos.stop_loss_first_seen > 0:
                         # Price recovered — reset timer
                         pos.stop_loss_first_seen = 0.0
@@ -691,9 +781,12 @@ class MemeBot:
         if not signal:
             return
         log.info(f"  SNIPE: {signal.symbol} ({signal.confidence:.0%}) — {signal.reason}")
-        if self.cfg.sniper_buy_delay > 0:
-            await asyncio.sleep(self.cfg.sniper_buy_delay)
-        await self._execute_buy(signal, auto_sell_sec=self.cfg.sniper_auto_sell_sec)
+        # Run off the WebSocket reader: a buy can take a long time to confirm
+        # and must not stop rug / copy-sell events from being processed.
+        self._spawn(self._execute_buy(
+            signal, auto_sell_sec=self.cfg.sniper_auto_sell_sec,
+            delay=self.cfg.sniper_buy_delay,
+        ))
 
     async def _on_account_trade(self, event: dict):
         """Handle smart money trade — buy copying + sell mirroring."""
@@ -721,7 +814,7 @@ class MemeBot:
             sell_signal = self.copy_trade.evaluate_sell(event, held)
             if sell_signal:
                 log.info(f"  COPY-SELL: {sell_signal.symbol} — {sell_signal.reason}")
-                await self._execute_sell(
+                self._spawn_sell(
                     sell_signal.mint, sell_signal.sell_pct,
                     sell_signal.reason,
                 )
@@ -732,9 +825,7 @@ class MemeBot:
         if not signal:
             return
         log.info(f"  COPY: {signal.symbol} ({signal.confidence:.0%}) — {signal.reason}")
-        if self.cfg.copy_delay_sec > 0:
-            await asyncio.sleep(self.cfg.copy_delay_sec)
-        await self._execute_buy(signal)
+        self._spawn(self._execute_buy(signal, delay=self.cfg.copy_delay_sec))
 
     async def _on_token_trade(self, event: dict):
         # Track all trades (buys + sells) for activity counting
@@ -773,7 +864,7 @@ class MemeBot:
                             self.sniper.blacklist_creator(mon.creator)
                             self.db.blacklist_creator(mon.creator, f"rug: {rug_signal.reason[:80]}")
                             log.info(f"  Creator {mon.creator[:8]}... blacklisted after rug")
-                    await self._execute_sell(
+                    self._spawn_sell(
                         rug_signal.mint, rug_signal.sell_pct, rug_signal.reason,
                     )
                     return
@@ -791,13 +882,14 @@ class MemeBot:
                     sol_price = await self.market.get_sol_price()
                     if sol_price > 0:
                         implied_price_usd = implied_price_sol * sol_price
-                        action, sell_pct = self.risk.check_exits(mint, implied_price_usd)
+                        action, sell_pct = self.risk.check_exits(
+                            mint, implied_price_usd, noisy=True)
                         if action != "none" and sell_pct > 0:
                             # WS prices are noisy (single-trade implied) —
                             # block stop-losses unless explicitly enabled
                             if "stop" not in action or self.cfg.ws_stop_loss_enabled:
                                 log.warning(f"  WS-EXIT: {self.risk.positions[mint].symbol} — {action}")
-                                await self._execute_sell(mint, sell_pct, f"ws_{action}")
+                                self._spawn_sell(mint, sell_pct, f"ws_{action}")
                             return
             except Exception as e:
                 log.debug(f"  WS price check error: {e}")
@@ -869,7 +961,7 @@ class MemeBot:
             if signal.mint in self.risk.positions:
                 continue
             log.info(f"  MOMENTUM: {signal.symbol} ({signal.confidence:.0%}) — {signal.reason}")
-            await self._execute_buy(signal)
+            self._spawn(self._execute_buy(signal))
 
     async def _evaluate_onchain_momentum(self, active_mints: list[tuple[str, int]]) -> list[Signal]:
         """Stage 3: Evaluate momentum using on-chain bonding curve data.
@@ -942,12 +1034,12 @@ class MemeBot:
                 continue
 
             # Growth×age ceiling: dynamic cap prevents buying peaked tokens
-            # A 5-min token at 60% is fine (12%/m), but 10-min at 120% is peaked
-            max_growth_for_age = age_min * 12
+            # A 5-min token at 100% is fine (20%/m), but 10-min at 200%+ is peaked
+            max_growth_for_age = age_min * self.cfg.peaked_age_multiplier
             if growth_pct > max_growth_for_age and age_min > 3:
                 skipped_reasons["peaked"] = skipped_reasons.get("peaked", 0) + 1
                 log.info(f"  AGE-CAP: {cand.symbol} | growth={growth_pct:.0f}% > "
-                         f"cap={max_growth_for_age:.0f}% (age={age_min:.1f}m × 12) | "
+                         f"cap={max_growth_for_age:.0f}% (age={age_min:.1f}m × {self.cfg.peaked_age_multiplier:.0f}) | "
                          f"SOL={state.real_sol:.1f}")
                 continue
 
@@ -1002,13 +1094,18 @@ class MemeBot:
                 reasons.append(f"Rate: {growth_rate:.0f}%/m")
 
             # ── Absolute growth (penalize peaked tokens) ──
-            if growth_pct >= 100:
-                # Hard reject: already 2x'd, probability of catching another
-                # 2x vs catching a dump is unfavorable
+            if growth_pct >= self.cfg.peaked_growth_cap_pct:
                 skipped_reasons["peaked"] = skipped_reasons.get("peaked", 0) + 1
-                log.info(f"  PEAKED: {cand.symbol} | growth={growth_pct:.0f}% | "
+                log.info(f"  PEAKED: {cand.symbol} | growth={growth_pct:.0f}% >= "
+                         f"{self.cfg.peaked_growth_cap_pct:.0f}% | "
                          f"SOL={state.real_sol:.1f} | curve={state.pct:.0f}%")
                 continue
+            elif growth_pct >= 100:
+                # Between 2x and the hard cap: allowed, but penalised.
+                # growth_pct is VIRTUAL-SOL growth and price scales with its
+                # square, so +100% here is already ~4x in price.
+                score -= 0.05
+                reasons.append(f"Extended +{growth_pct:.0f}%")
             elif 60 <= growth_pct < 100:
                 score += 0.05
                 reasons.append(f"Curve +{growth_pct:.0f}%")
@@ -1462,7 +1559,7 @@ class MemeBot:
                     token_data=token_data, creator=creator,
                 )
                 self.graduation.mark_bought(mint)
-                await self._execute_buy(signal)
+                self._spawn(self._execute_buy(signal))
 
             except Exception as e:
                 log.debug(f"  Post-grad buy error for {symbol}: {e}")
@@ -1472,6 +1569,7 @@ class MemeBot:
     # ══════════════════════════════════════════════════════════
 
     async def _check_positions(self):
+        await self._reconcile_positions()
         to_exit = []
 
         for mint, pos in list(self.risk.positions.items()):
@@ -1484,29 +1582,32 @@ class MemeBot:
             if not token:
                 price_usd = await self._get_onchain_price_usd(mint)
                 if price_usd and price_usd > 0:
+                    if pos.entry_price <= 0:
+                        # Opened without a price: arm the stop-loss from here
+                        self.risk.set_entry_price(mint, price_usd)
                     action, sell_pct = self.risk.check_exits(mint, price_usd)
                     if action != "none":
-                        to_exit.append((mint, action, sell_pct, None))
+                        to_exit.append((mint, action, sell_pct))
                     continue
 
                 # No price source at all — time-based exits only
                 if pos.auto_sell_at > 0 and time.time() >= pos.auto_sell_at:
-                    to_exit.append((mint, "auto_sell", 100, None))
+                    to_exit.append((mint, "auto_sell", 100))
                 elif self.cfg.max_hold_minutes > 0 and pos.age_min >= self.cfg.max_hold_minutes:
-                    to_exit.append((mint, "time_exit", 100, None))
+                    to_exit.append((mint, "time_exit", 100))
                 continue
 
+            if pos.entry_price <= 0 and token.price_usd > 0:
+                self.risk.set_entry_price(mint, token.price_usd, token.price_sol)
             action, sell_pct = self.risk.check_exits(mint, token.price_usd)
             if action != "none":
-                to_exit.append((mint, action, sell_pct, token))
+                to_exit.append((mint, action, sell_pct))
 
-        for mint, reason, sell_pct, token in to_exit:
-            await self._execute_sell(mint, sell_pct, reason)
-
-            # Post-graduation liquidity check: after TP2 graduated partial,
-            # verify DEX liquidity supports holding the remainder
-            if reason == "take_profit_graduated" and mint in self.risk.positions:
-                await self._check_post_grad_liquidity(mint)
+        # Sells run in the background so one slow exit cannot delay the
+        # checks (and exits) of every other position.
+        for mint, reason, sell_pct in to_exit:
+            self._spawn_sell(mint, sell_pct, reason,
+                             followup=(reason == "take_profit_graduated"))
 
     async def _update_position_curve(self, mint: str, pos):
         """Update bonding curve % for a held position (throttled to every ~10s)."""
@@ -1521,8 +1622,7 @@ class MemeBot:
                     self.rug_detector.update_curve_pct(mint, curve_pct)
                 # Detect graduation
                 if curve_pct >= 100 and not pos.graduated:
-                    pos.graduated = True
-                    pos.graduated_at = time.time()
+                    self.risk.mark_graduated(mint)
                     self._graduated_cache[mint] = True
                     log.info(f"  {pos.symbol} graduated — curve hit {curve_pct:.1f}% (5min grace active)")
         except Exception:
@@ -1538,31 +1638,28 @@ class MemeBot:
         if not pos:
             return
         try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status != 200:
-                        return
-                    data = await resp.json()
-                    pairs = data.get("pairs") or []
-                    if not pairs:
-                        # No DEX pair found — sell immediately
-                        log.warning(f"  POST-GRAD: {pos.symbol} no DEX pair — selling remainder")
-                        await self._execute_sell(mint, 100, "post_grad_no_liquidity")
-                        return
-                    # Find the pair with highest liquidity
-                    best_liq = 0
-                    for pair in pairs:
-                        liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
-                        if liq > best_liq:
-                            best_liq = liq
-                    if best_liq < 5000:
-                        log.warning(f"  POST-GRAD: {pos.symbol} low liquidity (${best_liq:.0f}) — selling remainder")
-                        await self._execute_sell(mint, 100, "post_grad_low_liquidity")
-                    else:
-                        log.info(f"  POST-GRAD: {pos.symbol} holding remainder — "
-                                 f"liquidity ${best_liq:,.0f} (40% trailing stop)")
+            resp = await self.market.http.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                pairs = data.get("pairs") or []
+                if not pairs:
+                    # No DEX pair found — sell immediately
+                    log.warning(f"  POST-GRAD: {pos.symbol} no DEX pair — selling remainder")
+                    await self._execute_sell(mint, 100, "post_grad_no_liquidity")
+                    return
+                # Find the pair with highest liquidity
+                best_liq = 0
+                for pair in pairs:
+                    liq = float(pair.get("liquidity", {}).get("usd", 0) or 0)
+                    if liq > best_liq:
+                        best_liq = liq
+                if best_liq < 5000:
+                    log.warning(f"  POST-GRAD: {pos.symbol} low liquidity (${best_liq:.0f}) — selling remainder")
+                    await self._execute_sell(mint, 100, "post_grad_low_liquidity")
+                else:
+                    log.info(f"  POST-GRAD: {pos.symbol} holding remainder — "
+                             f"liquidity ${best_liq:,.0f} (40% trailing stop)")
         except Exception as e:
             log.debug(f"  Post-grad liquidity check error: {e}")
             # On error, keep holding — conservative approach
@@ -1590,7 +1687,91 @@ class MemeBot:
     # TRADE EXECUTION
     # ══════════════════════════════════════════════════════════
 
-    async def _execute_buy(self, signal: Signal, auto_sell_sec: int = 0):
+    # ── Non-blocking wallet access ────────────────────────────
+    # The live wallet uses a synchronous RPC client. Calling it directly from
+    # a coroutine freezes every other task (WebSocket, stop-loss checks) for
+    # the duration of the HTTP request, so it runs in a worker thread.
+
+    async def _sol_balance(self) -> float:
+        if self.cfg.paper_trading:
+            return self.wallet.get_sol_balance()
+        return await asyncio.to_thread(self.wallet.get_sol_balance)
+
+    async def _token_balance(self, mint: str) -> float | None:
+        """Token balance, or None when it could not be read (NOT zero)."""
+        if self.cfg.paper_trading:
+            return self.wallet.get_token_balance(mint)
+        return await asyncio.to_thread(self.wallet.get_token_balance, mint)
+
+    async def _token_amount(self, mint: str) -> tuple[float, int, int] | None:
+        """(ui_amount, raw_amount, decimals), or None when unreadable."""
+        if self.cfg.paper_trading:
+            return self.wallet.get_token_amount(mint)
+        return await asyncio.to_thread(self.wallet.get_token_amount, mint)
+
+    async def _zero_balance_confirmed(self, mint: str) -> bool:
+        """Second, delayed read. True only if an RPC again reports 0 tokens."""
+        await asyncio.sleep(self.ZERO_RECHECK_DELAY)
+        bal = await self._token_balance(mint)
+        return bal is not None and bal <= 0
+
+    # ── Background trade tasks ────────────────────────────────
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Run a trade off the caller's loop so slow confirmations cannot
+        stall the WebSocket reader or the position monitor."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_task_done)
+        return task
+
+    def _bg_task_done(self, task: asyncio.Task):
+        self._bg_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            log.error(f"  Background trade task failed: {task.exception()}",
+                      exc_info=task.exception())
+
+    def _spawn_sell(self, mint: str, sell_pct: int, reason: str,
+                    followup: bool = False):
+        """Start a sell in the background unless an equal-or-larger sell of
+        the same mint is already in flight. A full exit is still allowed to
+        queue behind a partial one, so emergency exits are never dropped."""
+        if self._selling.get(mint, 0) >= sell_pct:
+            return
+        # After a failed sell, every automatic trigger (stop-loss, fast check,
+        # WebSocket, stuck retry) is held back for a while. Without this an
+        # unsellable token is retried continuously, and each failed attempt
+        # can still cost a priority fee. An emergency exit may go through
+        # once if the attempt that failed was not itself an emergency.
+        until, was_emergency = self._sell_backoff.get(mint, (0.0, False))
+        if time.time() < until and (was_emergency or not self._is_emergency(reason)):
+            return
+        self._selling[mint] = sell_pct
+        self._spawn(self._sell_task(mint, sell_pct, reason, followup))
+
+    @staticmethod
+    def _is_emergency(reason: str) -> bool:
+        return ("stop" in reason or "rug" in reason.lower()
+                or "fast" in reason or "ws_" in reason)
+
+    async def _sell_task(self, mint: str, sell_pct: int, reason: str,
+                         followup: bool):
+        try:
+            await self._execute_sell(mint, sell_pct, reason)
+            # Post-graduation liquidity check: after TP2 graduated partial,
+            # verify DEX liquidity supports holding the remainder
+            if followup and mint in self.risk.positions:
+                await self._check_post_grad_liquidity(mint)
+        finally:
+            if self._selling.get(mint) == sell_pct:
+                self._selling.pop(mint, None)
+
+    # ── Buy ───────────────────────────────────────────────────
+
+    async def _execute_buy(self, signal: Signal, auto_sell_sec: int = 0,
+                           delay: float = 0):
+        if delay and delay > 0:
+            await asyncio.sleep(delay)
         # Notify-only mode: log the signal and notify via Telegram, but don't trade
         if self.cfg.notify_only:
             log.info(f"  [NOTIFY-ONLY] Would buy {signal.symbol} ({signal.confidence:.0%}) — {signal.reason}")
@@ -1602,15 +1783,21 @@ class MemeBot:
             )
             return
         lock = self._get_mint_lock(signal.mint)
+        if lock.locked():
+            # A trade for this mint is already in flight. Drop the signal
+            # rather than queue it: a queued buy would fire late, on stale
+            # information, the moment the first attempt failed.
+            log.debug(f"  Buy signal dropped: {signal.symbol} already has a trade in flight")
+            return
         async with lock:
             await self._execute_buy_inner(signal, auto_sell_sec)
 
     async def _execute_buy_inner(self, signal: Signal, auto_sell_sec: int = 0):
         mint = signal.mint
-        if mint in self.risk.positions:
+        if mint in self.risk.positions or mint in self._reserved:
             return
 
-        # Hard no-re-entry: never buy a token we already traded this session
+        # Hard no-re-entry: never buy a token we already traded
         if mint in self._closed_mints:
             log.debug(f"  No re-entry: {signal.symbol} already traded")
             return
@@ -1622,15 +1809,24 @@ class MemeBot:
             log.info(f"  Cooldown: {signal.symbol} blocked for {remaining:.0f}m more")
             return
 
-        # Dynamic position sizing (wallet score affects copy-trade sizing)
-        sol_bal = self.wallet.get_sol_balance()
+        sol_bal = await self._sol_balance()
+        if mint in self.risk.positions or mint in self._reserved:
+            return
+
+        # Sizing + risk check + reservation happen with no await in between,
+        # so two concurrent buys cannot both pass the caps.
+        reserved_sol = sum(self._reserved.values())
+        reserved_count = len(self._reserved)
         size = self.risk.calc_size(sol_bal, signal.confidence, signal.strategy,
-                                   wallet=signal.creator)
+                                   wallet=signal.creator,
+                                   reserved_sol=reserved_sol)
         if size < 0.005:
             return
 
         # Risk check (includes cooldown)
-        can, reason = self.risk.can_open(size, signal.strategy)
+        can, reason = self.risk.can_open(size, signal.strategy,
+                                         reserved_sol=reserved_sol,
+                                         reserved_count=reserved_count)
         if not can:
             # Exempt high-confidence signals from cooldown
             if ("cooldown" in reason.lower()
@@ -1641,58 +1837,107 @@ class MemeBot:
                 log.info(f"  Risk block: {reason}")
                 return
 
-        # Safety check (DexScreener + on-chain)
+        self._reserved[mint] = size
+        try:
+            await self._execute_buy_checked(signal, size, auto_sell_sec)
+        finally:
+            self._reserved.pop(mint, None)
+
+    async def _safety_gate(self, signal: Signal) -> bool:
+        """Run safety checks. True = OK to buy.
+
+        Data that could not be read is treated as UNKNOWN: with
+        SAFETY_FAIL_CLOSED (default) the buy is skipped, but the token is not
+        blacklisted — an RPC hiccup says nothing about the token.
+        """
+        mint = signal.mint
+        fail_closed = self.cfg.safety_fail_closed
+        is_snipe = signal.strategy == "sniper"
+
         if signal.token_data:
             try:
                 safety = await self.safety.check(
-                    signal.token_data,
-                    is_snipe=(signal.strategy == "sniper"),
+                    signal.token_data, is_snipe=is_snipe,
                     creator=signal.creator,
                 )
-                if not safety.passed:
-                    log.warning(f"  Safety FAIL: {safety.warnings[:3]}")
-                    self.db.blacklist_token(mint, "; ".join(safety.warnings[:3]))
-                    return
             except Exception as e:
                 log.warning(f"  Safety check exception — skipping trade: {e}")
-                return
+                return False
+            if not safety.passed:
+                if safety.unverified:
+                    log.info(f"  Safety SKIP: on-chain data unavailable — "
+                             f"{signal.symbol} (not blacklisted)")
+                    return False
+                log.warning(f"  Safety FAIL: {safety.warnings[:3]}")
+                self.db.blacklist_token(mint, "; ".join(safety.warnings[:3]))
+                return False
+            return True
+
+        # No token_data — run on-chain safety (freeze auth + holders + creator)
+        try:
+            oc = await self.onchain.analyze(mint, signal.creator)
+        except Exception as e:
+            if is_snipe or fail_closed:
+                log.warning(f"  Safety SKIP: on-chain check failed — {signal.symbol}: {e}")
+                return False
+            log.debug(f"  On-chain safety check error: {e}")
+            return True
+
+        if not oc.mint_read_ok:
+            if is_snipe or fail_closed:
+                log.info(f"  Safety SKIP: mint account unreadable — "
+                         f"{signal.symbol} (not blacklisted)")
+                return False
+        elif not oc.freeze_authority_revoked:
+            log.warning(f"  Safety FAIL: freeze authority active — {signal.symbol}")
+            self.db.blacklist_token(mint, "freeze authority active")
+            return False
+
+        if not oc.holders_read_ok:
+            if fail_closed:
+                log.info(f"  Safety SKIP: holder data unavailable — "
+                         f"{signal.symbol} (not blacklisted)")
+                return False
         else:
-            # No token_data — run on-chain safety (freeze auth + holders + creator)
-            try:
-                oc = await self.onchain.analyze(mint, signal.creator)
-                if not oc.freeze_authority_revoked:
-                    log.warning(f"  Safety FAIL: freeze authority active — {signal.symbol}")
-                    self.db.blacklist_token(mint, "freeze authority active")
-                    return
-                # Young pump.fun tokens have concentrated holders — use relaxed
-                # thresholds: 70% for sniper, 50% for pipeline, 30% for mature tokens
-                if signal.strategy == "sniper":
-                    max_holder = self.cfg.sniper_max_top_holder_pct
-                else:
-                    max_holder = self.cfg.pipeline_max_top_holder_pct
-                if oc.top_holder_pct > max_holder:
-                    log.warning(f"  Safety FAIL: top holder {oc.top_holder_pct:.0f}% — {signal.symbol}")
-                    self.db.blacklist_token(mint, f"top holder {oc.top_holder_pct:.0f}%")
-                    return
+            # Young pump.fun tokens have concentrated holders — use relaxed
+            # thresholds: 70% for sniper, 50% for pipeline, 30% for mature tokens
+            max_holder = (self.cfg.sniper_max_top_holder_pct if is_snipe
+                          else self.cfg.pipeline_max_top_holder_pct)
+            if oc.top_holder_pct > max_holder:
+                log.warning(f"  Safety FAIL: top holder {oc.top_holder_pct:.0f}% — {signal.symbol}")
+                self.db.blacklist_token(mint, f"top holder {oc.top_holder_pct:.0f}%")
+                return False
+            # Minimum holder count
+            if 0 < oc.holder_count < self.cfg.min_holder_count:
+                log.warning(f"  Safety FAIL: only {oc.holder_count} holders — {signal.symbol}")
+                return False
+
+        if signal.creator:
+            if not oc.creator_read_ok:
+                if fail_closed:
+                    log.info(f"  Safety SKIP: creator history unavailable — "
+                             f"{signal.symbol} (not blacklisted)")
+                    return False
+            else:
                 # Hard block serial deployers
-                if signal.creator and oc.creator_token_count >= self.cfg.max_creator_tx_count:
+                if oc.creator_token_count >= self.cfg.max_creator_tx_count:
                     log.warning(f"  Safety FAIL: creator {signal.creator[:8]} has "
                                 f"{oc.creator_token_count}+ txs — {signal.symbol}")
                     self.db.blacklist_creator(signal.creator,
                                               f"serial deployer ({oc.creator_token_count} txs)")
-                    return
+                    return False
                 # Soft log for moderately active creators
-                if signal.creator and oc.creator_token_count >= 50:
+                if oc.creator_token_count >= 50:
                     log.info(f"  Creator active ({oc.creator_token_count} recent txs) — {signal.symbol}")
-                # Minimum holder count
-                if oc.holder_count > 0 and oc.holder_count < self.cfg.min_holder_count:
-                    log.warning(f"  Safety FAIL: only {oc.holder_count} holders — {signal.symbol}")
-                    return
-            except Exception as e:
-                if signal.strategy == "sniper":
-                    log.warning(f"  Safety FAIL: on-chain check failed for sniper — {signal.symbol}: {e}")
-                    return  # HARD BLOCK — don't snipe if we can't verify
-                log.debug(f"  On-chain safety check error: {e}")
+        return True
+
+    async def _execute_buy_checked(self, signal: Signal, size: float,
+                                   auto_sell_sec: int = 0):
+        mint = signal.mint
+
+        # Safety check (DexScreener + on-chain)
+        if not await self._safety_gate(signal):
+            return
 
         # Pre-entry creator balance check — large SOL balance = dump risk
         if signal.creator and signal.strategy == "momentum":
@@ -1728,133 +1973,295 @@ class MemeBot:
 
             ok = self.wallet.buy(mint, signal.symbol, size, tokens, price_usd)
             if ok:
+                is_grad = signal.strategy == "graduation"
                 self.risk.open(
                     mint, signal.symbol, price_usd, price_sol,
                     tokens, size, signal.strategy, auto_sell_sec,
-                    creator=signal.creator,
+                    creator=signal.creator, graduated=is_grad,
                 )
-                # Mark post-graduation buys as graduated immediately
-                if signal.strategy == "graduation" and mint in self.risk.positions:
-                    self.risk.positions[mint].graduated = True
-                    self.risk.positions[mint].graduated_at = time.time()
+                if is_grad:
                     self._graduated_cache[mint] = True
                 self.notify.trade_alert("buy", signal.symbol, size,
                                          reason=signal.reason)
         else:
-            log.info(f"  Buying {signal.symbol} for {size:.4f} SOL...")
-
-            # Post-graduation buys go through Jupiter (token is on PumpSwap/Raydium)
-            if signal.strategy == "graduation" and self.cfg.use_jupiter:
-                tx = await self.jupiter.buy_token(
-                    mint, size,
-                    slippage_bps=self.cfg.jupiter_slippage_bps,
-                    use_jito=self.pump.use_jito,
-                )
-                if tx:
-                    self.db.save_position(
-                        mint=mint, symbol=signal.symbol, entry_price=0,
-                        entry_sol_price=0, tokens=0, sol_invested=size,
-                        entry_time=time.time(), strategy=signal.strategy,
-                        tx_signature=tx,
-                        extra={"creator": signal.creator, "pending": True,
-                               "graduated": True},
-                    )
-                    await asyncio.sleep(2)
-                    total_spent, price_usd, price_sol, tokens, _sol_tok = \
-                        await self._resolve_buy_prices(mint, size, tx)
-                    self.risk.open(
-                        mint, signal.symbol, price_usd, price_sol,
-                        tokens, total_spent, signal.strategy, auto_sell_sec,
-                        tx_signature=tx, creator=signal.creator,
-                    )
-                    # Mark as graduated immediately (bought post-graduation)
-                    if mint in self.risk.positions:
-                        self.risk.positions[mint].graduated = True
-                        self.risk.positions[mint].graduated_at = time.time()
-                        self._graduated_cache[mint] = True
-                    self.notify.trade_alert("buy", signal.symbol, total_spent,
-                                             reason=signal.reason, tx=tx)
-                else:
-                    log.error(f"  Jupiter buy FAILED for {signal.symbol}")
-
-                # Start rug monitoring if position was opened
-                if mint in self.risk.positions:
-                    await self._on_position_opened(mint, signal.creator)
-                return
-
-            slippage = (self.cfg.momentum_slippage_pct
-                        if signal.strategy == "momentum"
-                        else self.cfg.slippage_pct)
-            tx = await self.pump.buy(
-                mint, size,
-                slippage=slippage,
-                priority_fee=self.cfg.priority_fee_sol,
-            )
-            if tx:
-                # Immediately record position to DB to survive crashes.
-                # Uses estimated values; updated with actuals below.
-                self.db.save_position(
-                    mint=mint, symbol=signal.symbol, entry_price=0,
-                    entry_sol_price=0, tokens=0, sol_invested=size,
-                    entry_time=time.time(), strategy=signal.strategy,
-                    tx_signature=tx,
-                    extra={"creator": signal.creator, "pending": True},
-                )
-                await asyncio.sleep(2)
-                total_spent, price_usd, price_sol, tokens, _sol_tok = \
-                    await self._resolve_buy_prices(mint, size, tx)
-                self.risk.open(
-                    mint, signal.symbol, price_usd, price_sol,
-                    tokens, total_spent, signal.strategy, auto_sell_sec,
-                    tx_signature=tx, creator=signal.creator,
-                )
-                self.notify.trade_alert("buy", signal.symbol, total_spent,
-                                         reason=signal.reason, tx=tx)
-            else:
-                log.error(f"  Buy FAILED for {signal.symbol} — retrying once...")
-                tx = await self.pump.buy(
-                    mint, size,
-                    slippage=self.cfg.slippage_pct,
-                    priority_fee=self.cfg.priority_fee_sol * 2,
-                )
-                if tx:
-                    self.db.save_position(
-                        mint=mint, symbol=signal.symbol, entry_price=0,
-                        entry_sol_price=0, tokens=0, sol_invested=size,
-                        entry_time=time.time(), strategy=signal.strategy,
-                        tx_signature=tx,
-                        extra={"creator": signal.creator, "pending": True},
-                    )
-                    await asyncio.sleep(2)
-                    total_spent, price_usd, price_sol, tokens, _sol_tok = \
-                        await self._resolve_buy_prices(mint, size, tx)
-                    self.risk.open(
-                        mint, signal.symbol, price_usd, price_sol,
-                        tokens, total_spent, signal.strategy, auto_sell_sec,
-                        tx_signature=tx, creator=signal.creator,
-                    )
-                    self.notify.trade_alert("buy", signal.symbol, total_spent,
-                                             reason=signal.reason, tx=tx)
-                    return
-
-                # Check if we actually bought (tx confirmed but response lost)
-                await asyncio.sleep(3)
-                actual_tokens = self.wallet.get_token_balance(mint)
-                if actual_tokens > 0 and mint not in self.risk.positions:
-                    log.warning(f"  Surprise! We own {actual_tokens} tokens of "
-                                f"{signal.symbol} — recording phantom buy")
-                    token_data = await self.market.get_token(mint)
-                    price_usd = token_data.price_usd if token_data else 0
-                    price_sol = token_data.price_sol if token_data else 0
-                    self.risk.open(
-                        mint, signal.symbol, price_usd, price_sol,
-                        actual_tokens, size, signal.strategy, auto_sell_sec,
-                        tx_signature="phantom", creator=signal.creator,
-                    )
+            await self._live_buy(signal, size, auto_sell_sec)
 
         # Start rug monitoring if position was opened
         if mint in self.risk.positions:
             await self._on_position_opened(mint, signal.creator)
+
+    async def _live_buy(self, signal: Signal, size: float, auto_sell_sec: int):
+        """Send a live buy and record exactly what happened.
+
+        Invariants:
+        - a buy that landed ALWAYS becomes a tracked position;
+        - a buy is never sent twice (see PumpPortal.buy / JupiterSwap.buy_token);
+        - a position is never opened for a buy known to have failed.
+        """
+        mint = signal.mint
+        # Post-graduation buys go through Jupiter (token is on PumpSwap/Raydium)
+        via_jupiter = signal.strategy == "graduation" and self.cfg.use_jupiter
+        log.info(f"  Buying {signal.symbol} for {size:.4f} SOL...")
+        bal_before = await self._token_balance(mint)
+
+        if via_jupiter:
+            result = await self.jupiter.buy_token(
+                mint, size,
+                slippage_bps=self.cfg.jupiter_slippage_bps,
+                use_jito=self.pump.use_jito,
+            )
+        else:
+            slippage = (self.cfg.momentum_slippage_pct
+                        if signal.strategy == "momentum"
+                        else self.cfg.slippage_pct)
+            result = await self.pump.buy(
+                mint, size,
+                slippage=slippage,
+                priority_fee=self.cfg.priority_fee_sol,
+            )
+
+        if result.failed:
+            # A definite failure should leave no tokens. One cheap look guards
+            # against a misreported failure leaving tokens untracked.
+            bal = await self._token_balance(mint)
+            if bal is None or bal <= (bal_before or 0):
+                log.error(f"  Buy FAILED for {signal.symbol}")
+                return
+            log.warning(f"  Buy reported failed but {bal} tokens of "
+                        f"{signal.symbol} arrived — recording it")
+            result = TradeResult("unknown", result.sig, result.via_lightning,
+                                 result.sigs)
+
+        # Persist immediately so a crash from here on cannot orphan tokens.
+        self.db.save_position(
+            mint=mint, symbol=signal.symbol, entry_price=0,
+            entry_sol_price=0, tokens=0, sol_invested=size,
+            entry_time=time.time(), strategy=signal.strategy,
+            tx_signature=result.sig,
+            extra={"creator": signal.creator, "pending": True,
+                   "graduated": via_jupiter},
+        )
+
+        fill = await self._resolve_buy(signal, size, result, bal_before)
+        if fill is None:
+            self.db.delete_position(mint)
+            return
+
+        tokens, sol_spent, price_usd, price_sol, unverified = fill
+        self.risk.open(
+            mint, signal.symbol, price_usd, price_sol,
+            tokens, sol_spent, signal.strategy, auto_sell_sec,
+            tx_signature=result.sig or "phantom", creator=signal.creator,
+            graduated=via_jupiter, buy_unverified=unverified,
+        )
+        if via_jupiter:
+            self._graduated_cache[mint] = True
+        self.notify.trade_alert("buy", signal.symbol, sol_spent,
+                                 reason=signal.reason, tx=result.sig)
+
+    async def _resolve_buy(self, signal: Signal, estimated_sol: float,
+                           result: TradeResult, bal_before: float | None):
+        """Work out what a buy actually did.
+
+        Returns (tokens, sol_spent, price_usd, price_sol, unverified), or None
+        when the buy did not happen. The transaction itself is the primary
+        source; the wallet balance is the fallback.
+        """
+        mint = signal.mint
+        owner = self.wallet.pubkey
+        tokens = 0.0
+        sol_spent = estimated_sol
+        sol_for_tokens = estimated_sol
+        landed = result.confirmed
+
+        if result.sig:
+            tx = await self.pump.get_tx_result(
+                result.sig, retries=4 if result.confirmed else 2)
+            out = parse_tx_outcome(tx, owner, mint)
+            if out is not None:
+                if out.err is not None:
+                    log.warning(f"  Buy tx failed on-chain for {signal.symbol}: {out.err}")
+                    return None
+                if not out.owner_found:
+                    if result.via_lightning:
+                        self._lightning_wallet_mismatch(signal.symbol, result.sig)
+                        return None
+                else:
+                    landed = True
+                    if out.sol_delta < 0:
+                        sol_spent = -out.sol_delta
+                        # Subtract known fees so entry price reflects only the
+                        # SOL that bought tokens, not tx overhead.
+                        fee_deduction = out.fee + self.cfg.jito_tip_sol
+                        sol_for_tokens = sol_spent - fee_deduction
+                        if sol_for_tokens <= 0:
+                            sol_for_tokens = sol_spent
+                        log.info(f"  Entry: {sol_spent:.6f} total, "
+                                 f"{fee_deduction:.6f} fees, "
+                                 f"{sol_for_tokens:.6f} for tokens")
+                    if out.token_delta > 0:
+                        tokens = out.token_post
+
+        last_bal = None
+        if tokens <= 0:
+            # No usable tx data — watch the wallet. With no signature at all
+            # (Lightning timed out) the trade may still land any time until
+            # its blockhash expires, so that case waits the full window.
+            if landed:
+                tries, pause = self.BUY_BALANCE_POLLS_CONFIRMED
+            elif result.sig:
+                tries, pause = self.BUY_BALANCE_POLLS_UNKNOWN
+            else:
+                tries, pause = self.BUY_BALANCE_POLLS_NO_SIG
+            for i in range(tries):
+                last_bal = await self._token_balance(mint)
+                if last_bal is not None and last_bal > (bal_before or 0):
+                    tokens = last_bal
+                    landed = True
+                    break
+                if i < tries - 1:
+                    await asyncio.sleep(pause)
+
+        unverified = False
+        if tokens <= 0:
+            if landed:
+                # Confirmed, but the balance is not visible yet. Track it
+                # anyway; reconciliation fills the token count in.
+                log.warning(f"  {signal.symbol}: buy confirmed but token balance "
+                            f"not readable yet — tracking, will reconcile")
+            elif last_bal is None:
+                # Outcome unknown AND the wallet is unreadable. We may hold
+                # tokens: track it as unverified rather than risk an orphan.
+                unverified = True
+                log.error(f"  {signal.symbol}: buy outcome UNKNOWN and balance "
+                          f"unreadable — tracking as unverified")
+                self.notify.send(
+                    f"WARNING: buy of {signal.symbol} ({mint[:16]}...) has an "
+                    f"unknown outcome (RPC unreachable). Tracking it as "
+                    f"unverified until the wallet can be read."
+                )
+            else:
+                log.warning(f"  {signal.symbol}: buy outcome unknown and no "
+                            f"tokens arrived — not opening a position")
+                self.notify.send(
+                    f"Buy of {signal.symbol} was not confirmed and no tokens "
+                    f"arrived — no position opened."
+                )
+                return None
+
+        price_usd = 0.0
+        price_sol = 0.0
+        if tokens > 0 and sol_for_tokens > 0:
+            price_sol = sol_for_tokens / tokens
+            sol_price = await self.market.get_sol_price()
+            price_usd = price_sol * sol_price if sol_price > 0 else 0.0
+
+        if price_usd <= 0:
+            # Bonding-curve price: available immediately, unlike DexScreener
+            price_usd = await self._get_onchain_price_usd(mint) or 0.0
+            sol_price = await self.market.get_sol_price()
+            price_sol = price_usd / sol_price if price_usd > 0 and sol_price > 0 else 0.0
+
+        if price_usd <= 0:
+            token_data = await self.market.get_token(mint)
+            price_usd = token_data.price_usd if token_data else 0.0
+            price_sol = token_data.price_sol if token_data else 0.0
+
+        if price_usd <= 0:
+            log.warning(f"  {signal.symbol}: no entry price yet — it will be set "
+                        f"from the first price read (stop-loss arms then)")
+
+        return tokens, sol_spent, price_usd, price_sol, unverified
+
+    def _lightning_wallet_mismatch(self, symbol: str, sig: str):
+        """A Lightning trade was not paid by the bot's wallet: the API key
+        belongs to a different wallet, so the bot cannot see or manage what
+        Lightning buys. Stop using Lightning and tell the operator."""
+        log.error(f"  LIGHTNING WALLET MISMATCH on {symbol}: tx {sig} was not "
+                  f"signed by {self.wallet.pubkey} — disabling Lightning")
+        self.pump.api_key = ""
+        self.notify.send(
+            f"CRITICAL: Lightning trade for {symbol} was NOT made from the bot "
+            f"wallet ({self.wallet.pubkey[:8]}...). PUMPPORTAL_API_KEY belongs "
+            f"to a different wallet. Lightning is disabled for this session. "
+            f"That trade sits in the Lightning wallet and is NOT managed. "
+            f"TX: {sig}"
+        )
+
+    # ── Position reconciliation ───────────────────────────────
+
+    async def _reconcile_positions(self, force: bool = False):
+        """Fill in token counts for positions opened without them (unverified
+        buys, crash-recovered pending rows), and drop buys that never landed."""
+        if self.cfg.paper_trading:
+            return
+        for mint, pos in list(self.risk.positions.items()):
+            if pos.tokens > 0 and not pos.buy_unverified:
+                continue
+            now = time.time()
+            if not force and now - pos.last_balance_check < 10:
+                continue
+            pos.last_balance_check = now
+            bal = await self._token_balance(mint)
+            if bal is None:
+                continue
+            if bal > 0:
+                pos.tokens = bal
+                pos.buy_unverified = False
+                self.risk.persist(pos)
+                log.info(f"  Reconciled {pos.symbol}: {bal:.0f} tokens on-chain")
+            elif (pos.age_sec > self.RECONCILE_GRACE_SEC
+                    and mint not in self._selling
+                    and mint in self.risk.positions
+                    and await self._zero_balance_confirmed(mint)):
+                await self._close_no_tokens(mint, pos, "reconcile")
+
+    async def _sol_from_sell_sigs(self, mint: str) -> float:
+        """SOL received from earlier sell attempts whose outcome we never
+        confirmed, read from the transactions themselves."""
+        total = 0.0
+        for sig in self._sell_sigs.get(mint, [])[-10:]:
+            try:
+                tx = await self.pump.get_tx_result(sig)
+                out = parse_tx_outcome(tx, self.wallet.pubkey, mint)
+                if out and out.err is None and out.owner_found and out.sol_delta > 0:
+                    total += out.sol_delta
+            except Exception as e:
+                log.debug(f"  Sell sig lookup error: {e}")
+        return total
+
+    async def _close_no_tokens(self, mint: str, pos, reason: str):
+        """Close a position whose tokens are confirmed gone (two RPC reads).
+
+        - Unverified buy with no sell on record: it never landed. Drop it
+          without booking a loss on SOL that was never spent.
+        - Otherwise the tokens were sold: credit whatever earlier unconfirmed
+          sell transactions actually paid out.
+        """
+        if mint not in self.risk.positions:
+            return
+        recovered_sol = await self._sol_from_sell_sigs(mint)
+        self._sell_sigs.pop(mint, None)
+        self._partial_hold.pop(mint, None)
+        self._clear_stuck(mint)
+
+        if pos.buy_unverified and recovered_sol <= 0:
+            self.risk.discard(mint, f"{reason}: buy never landed")
+            self.notify.send(f"{pos.symbol}: buy never landed — position dropped, no loss booked.")
+            await self._on_position_closed(mint)
+            return
+
+        log.warning(f"  {pos.symbol}: no tokens on-chain — closing "
+                    f"(recovered {recovered_sol:.4f} SOL from earlier sells)")
+        pnl = self.risk.close(mint, recovered_sol, f"{reason}_no_tokens")
+        # Only feed the loss into cooldown/blacklist logic when we know what
+        # was received; an unexplained zero balance is not evidence of a rug.
+        await self._on_position_closed(
+            mint, pnl=pnl if recovered_sol > 0 else None,
+            strategy=pos.strategy, creator=pos.creator)
+        self.notify.trade_alert("sell", pos.symbol, recovered_sol, pnl=pnl,
+                                 reason=f"{reason} (tokens already gone)",
+                                 daily_pnl=self.risk.daily_pnl)
 
     async def _on_ws_reconnect(self):
         """Audit all held positions after WebSocket reconnect.
@@ -1873,28 +2280,30 @@ class MemeBot:
         log.info(f"  WS reconnect audit: checking {len(positions)} positions...")
 
         if not self.cfg.paper_trading:
-            to_remove = []
             for mint, pos in positions:
                 try:
-                    balance = self.wallet.get_token_balance(mint)
+                    balance = await self._token_balance(mint)
+                    if balance is None:
+                        log.warning(f"  WS audit: {pos.symbol} balance check failed (RPC error) — skipping")
+                        continue
                     if balance <= 0:
-                        log.warning(f"  WS audit: {pos.symbol} has 0 balance — removing")
-                        to_remove.append(mint)
+                        if (pos.age_sec > self.RECONCILE_GRACE_SEC
+                                and mint not in self._selling
+                                and await self._zero_balance_confirmed(mint)):
+                            log.warning(f"  WS audit: {pos.symbol} has 0 balance — closing")
+                            await self._close_no_tokens(mint, pos, "ws_audit")
                     elif abs(balance - pos.tokens) / max(pos.tokens, 1) > 0.5:
                         log.warning(f"  WS audit: {pos.symbol} balance mismatch "
                                     f"(expected {pos.tokens:.0f}, got {balance:.0f}) — updating")
                         pos.tokens = balance
-                        self.db.update_position(mint, tokens=balance)
+                        pos.buy_unverified = False
+                        self.risk.persist(pos)
                 except Exception as e:
                     log.debug(f"  WS audit balance check error for {mint[:8]}: {e}")
 
-            for mint in to_remove:
-                self.risk.close(mint, 0, "ws_audit_zero_balance")
-                await self._on_position_closed(mint)
-
         # Re-subscribe tokens for rug detection
         if hasattr(self, 'rug_detector'):
-            for mint, pos in self.risk.positions.items():
+            for mint in list(self.risk.positions.keys()):
                 try:
                     await self.stream.subscribe_token(mint)
                 except Exception:
@@ -1933,7 +2342,7 @@ class MemeBot:
     async def _on_position_closed(self, mint: str, pnl: float = None,
                                    strategy: str = "", creator: str = ""):
         """Hook called after a position is fully closed."""
-        # Permanent no-re-entry — never buy this token again this session
+        # No-re-entry — never buy this token again
         self._closed_mints.add(mint)
 
         # Record cooldown for losing trades to prevent re-entry
@@ -1962,67 +2371,21 @@ class MemeBot:
             await self.stream.unsubscribe_token(mint)
         self._graduated_cache.pop(mint, None)
 
-    async def _resolve_buy_prices(self, mint: str, estimated_sol: float,
-                                   tx_sig: str = ""
-                                   ) -> tuple[float, float, float, float, float]:
-        """Resolve actual SOL spent, prices, and token balance after a buy tx.
-
-        Returns (total_sol_spent, price_usd, price_sol, tokens, sol_for_tokens).
-        total_sol_spent = full wallet impact (for sol_invested / PnL tracking).
-        sol_for_tokens  = SOL that actually bought tokens (for entry price).
-        """
-        total_sol_spent = estimated_sol
-        sol_for_tokens = estimated_sol
-        price_usd = 0
-        price_sol = 0
-        tx_result = await self.pump.get_tx_result(tx_sig) if tx_sig else None
-        if tx_result:
-            try:
-                meta = tx_result.get("meta", {})
-                pre = meta.get("preBalances", [])
-                post = meta.get("postBalances", [])
-                if pre and post and len(pre) > 0 and len(post) > 0:
-                    sol_diff = (pre[0] - post[0]) / 1e9
-                    if sol_diff > 0:
-                        total_sol_spent = sol_diff
-                        # Subtract known fees so entry price reflects
-                        # only the SOL that bought tokens, not tx overhead.
-                        tx_fee = meta.get("fee", 0) / 1e9  # base + priority
-                        fee_deduction = tx_fee + self.cfg.jito_tip_sol
-                        sol_for_tokens = sol_diff - fee_deduction
-                        if sol_for_tokens <= 0:
-                            sol_for_tokens = sol_diff  # fallback
-                        log.info(f"  Entry: {sol_diff:.6f} total, "
-                                 f"{fee_deduction:.6f} fees, "
-                                 f"{sol_for_tokens:.6f} for tokens")
-            except Exception as e:
-                log.debug(f"  Could not parse tx result: {e}")
-
-        tokens = self.wallet.get_token_balance(mint)
-        if tokens > 0 and sol_for_tokens > 0:
-            price_sol = sol_for_tokens / tokens
-            sol_price = await self.market.get_sol_price()
-            price_usd = price_sol * sol_price if sol_price > 0 else 0
-
-        if price_usd <= 0 or price_sol <= 0:
-            token_data = await self.market.get_token(mint)
-            price_usd = token_data.price_usd if token_data else 0
-            price_sol = token_data.price_sol if token_data else 0
-
-        return total_sol_spent, price_usd, price_sol, tokens, sol_for_tokens
-
     def _get_mint_lock(self, mint: str) -> asyncio.Lock:
         if mint not in self._mint_locks:
             self._mint_locks[mint] = asyncio.Lock()
         return self._mint_locks[mint]
 
+    # ── Sell ──────────────────────────────────────────────────
+
     async def _execute_sell(self, mint: str, sell_pct: int, reason: str):
+        # The lock is deliberately NOT removed here: popping it while another
+        # caller waits would hand a third caller a fresh lock and let two
+        # sells of the same mint run at once. Idle locks are pruned in the
+        # poll loop instead.
         lock = self._get_mint_lock(mint)
         async with lock:
             await self._execute_sell_inner(mint, sell_pct, reason)
-        # Clean up lock if position is closed (sell_pct == 100)
-        if sell_pct >= 100:
-            self._mint_locks.pop(mint, None)
 
     async def _execute_sell_inner(self, mint: str, sell_pct: int, reason: str):
         pos = self.risk.positions.get(mint)
@@ -2076,29 +2439,17 @@ class MemeBot:
                                          balance=self.wallet.sol_balance,
                                          daily_pnl=self.risk.daily_pnl)
         else:
-            # For emergency exits, use cached graduation flag (skip RPC call)
-            # For normal exits, do the full check
-            is_emergency = ("stop" in reason or "rug" in reason.lower()
-                            or "fast" in reason or "ws_" in reason)
-            if is_emergency:
-                graduated = pos.graduated  # use cached flag, no RPC
-            else:
-                graduated = await self._is_graduated(mint, pos)
-
-            if graduated and self.cfg.use_jupiter:
-                await self._sell_via_jupiter(mint, pos, sell_pct, is_partial, reason)
-            else:
-                await self._sell_via_pumpportal(mint, pos, sell_pct, is_partial, reason)
+            await self._live_sell(mint, pos, sell_pct, is_partial, reason)
 
     async def _get_sol_received(self, sol_before: float, pos,
                                 retries: int = 3) -> float:
-        """Get SOL received after a sell tx, retrying if balance unchanged.
+        """Fallback estimate of sell proceeds from the wallet's SOL change.
 
-        RPC may not reflect the new balance immediately after tx confirmation.
-        Retries with short delays to avoid recording 0 SOL on valid sells.
+        Only used when the sell transaction itself cannot be read; it is
+        inaccurate if another trade moves the wallet balance at the same time.
         """
         for attempt in range(retries):
-            sol_after = self.wallet.get_sol_balance()
+            sol_after = await self._sol_balance()
             sol_received = max(sol_after - sol_before, 0)
             if sol_received > 0:
                 return sol_received
@@ -2109,142 +2460,285 @@ class MemeBot:
                 await asyncio.sleep(wait)
         return 0.0
 
-    async def _sell_via_jupiter(self, mint: str, pos, sell_pct: int,
-                                is_partial: bool, reason: str):
-        """Sell graduated tokens through Jupiter V6."""
-        log.info(f"  Selling {pos.symbol} via Jupiter (graduated)")
-        token_balance = self.wallet.get_token_balance(mint)
-        if token_balance <= 0:
-            log.warning(f"  No token balance for Jupiter sell: {pos.symbol}")
-            # Fall back to PumpPortal
-            await self._sell_via_pumpportal(mint, pos, sell_pct, is_partial, reason)
+    async def _live_sell(self, mint: str, pos, sell_pct: int,
+                         is_partial: bool, reason: str):
+        """Sell on-chain and act only on what verifiably happened.
+
+        Invariant: a live position is closed ONLY when the sell transaction is
+        confirmed or an RPC read shows the tokens left the wallet. A sell we
+        cannot verify leaves the position open to be retried — never written
+        off while the tokens may still be held.
+        """
+        # For emergency exits, use cached graduation flag (skip RPC call)
+        # For normal exits, do the full check
+        is_emergency = self._is_emergency(reason)
+
+        # An earlier partial sell with an unknown outcome may still land.
+        # Sending another partial now could sell twice as much as intended.
+        if is_partial and not await self._partial_hold_cleared(mint, pos):
             return
 
-        sell_amount = token_balance * (sell_pct / 100)
-        decimals = await self.onchain.get_token_decimals(mint)
-        raw_amount = int(sell_amount * (10 ** decimals))
-
-        if raw_amount <= 0:
-            await self._sell_via_pumpportal(mint, pos, sell_pct, is_partial, reason)
-            return
-
-        sol_before = self.wallet.get_sol_balance()
-        tx = await self.jupiter.sell_token(
-            mint, raw_amount,
-            slippage_bps=self.cfg.jupiter_slippage_bps,
-            use_jito=self.pump.use_jito,
-        )
-        if tx:
-            sell_pnl = None
-            sol_received = await self._get_sol_received(sol_before, pos)
-            if is_partial:
-                self.risk.partial_close(mint, sol_received=sol_received,
-                                        reason=f"{reason} (jupiter)")
-            else:
-                sell_pnl = self.risk.close(mint, sol_received, reason, tx)
-                await self._on_position_closed(mint, pnl=sell_pnl,
-                                               strategy=pos.strategy, creator=pos.creator)
-            self.notify.trade_alert("sell", pos.symbol, pos.sol_invested,
-                                     pnl=sell_pnl, reason=f"{reason} (jupiter)",
-                                     tx=tx, balance=self.wallet.sol_balance,
-                                     daily_pnl=self.risk.daily_pnl)
-        else:
-            log.warning(f"  Jupiter sell failed for {pos.symbol}, falling back to PumpPortal")
-            await self._sell_via_pumpportal(mint, pos, sell_pct, is_partial, reason)
-
-    async def _sell_via_pumpportal(self, mint: str, pos, sell_pct: int,
-                                   is_partial: bool, reason: str):
-        """Sell tokens through PumpPortal (bonding curve or fallback)."""
-        is_emergency = ("stop" in reason or "rug" in reason.lower()
-                        or "fast" in reason or "ws_" in reason)
-        sell_slippage = 40 if is_emergency else self.cfg.slippage_pct
-        sell_fee = min(self.cfg.priority_fee_sol * 2, 0.01) if is_emergency else self.cfg.priority_fee_sol
-        sol_before = self.wallet.get_sol_balance()
-        tx = await self.pump.sell(
-            mint, sell_pct=sell_pct,
-            slippage=sell_slippage,
-            priority_fee=sell_fee,
-            skip_jito=is_emergency,
-        )
-        if tx:
-            sell_pnl = None
-            sol_received = await self._get_sol_received(sol_before, pos)
-            if is_partial:
-                self.risk.partial_close(mint, sol_received=sol_received,
-                                        reason=reason)
-            else:
-                sell_pnl = self.risk.close(mint, sol_received, reason, tx)
-                await self._on_position_closed(mint, pnl=sell_pnl,
-                                               strategy=pos.strategy, creator=pos.creator)
-
-            self.notify.trade_alert("sell", pos.symbol, pos.sol_invested,
-                                     pnl=sell_pnl, reason=reason, tx=tx,
-                                     balance=self.wallet.sol_balance,
-                                     daily_pnl=self.risk.daily_pnl)
-        else:
-            log.error(f"  Sell FAILED for {pos.symbol} — CRITICAL!")
-            # Check if token graduated during our hold — PumpPortal can't sell graduated tokens
-            if self.cfg.use_jupiter and not pos.graduated:
-                graduated = await self._is_graduated(mint, pos)
-                if graduated:
-                    log.info(f"  {pos.symbol} graduated — retrying via Jupiter")
-                    await self._sell_via_jupiter(mint, pos, sell_pct, is_partial, reason)
-                    return
-            elif pos.graduated and self.cfg.use_jupiter:
-                log.info(f"  {pos.symbol} already graduated — retrying via Jupiter")
-                await self._sell_via_jupiter(mint, pos, sell_pct, is_partial, reason)
+        amount = await self._token_amount(mint)   # None = unreadable, not zero
+        if amount is not None and amount[0] <= 0:
+            if (pos.age_sec >= self.ZERO_CLOSE_MIN_AGE_SEC
+                    and await self._zero_balance_confirmed(mint)):
+                await self._close_no_tokens(mint, pos, reason)
                 return
+            # Too soon after the buy to trust a zero read (RPC lag)
+            log.warning(f"  {pos.symbol}: balance reads 0 — not selling yet")
+            if not is_partial:
+                self._mark_stuck(mint, pos, emergency=is_emergency)
+            return
 
-            # Last-resort retry: max slippage, skip Jito, higher fee
-            retry_fee = min(self.cfg.priority_fee_sol * 2,
-                            pos.sol_invested * 0.15)
-            sol_before2 = self.wallet.get_sol_balance()
-            tx2 = await self.pump.sell(
-                mint, sell_pct=sell_pct,
-                slippage=50,
-                priority_fee=retry_fee,
-                skip_jito=True,
-            )
-            if tx2:
-                sol_received2 = await self._get_sol_received(sol_before2, pos)
-                sell_pnl2 = None
-                if not is_partial:
-                    sell_pnl2 = self.risk.close(mint, sol_received2, reason, tx2)
-                    await self._on_position_closed(mint, pnl=sell_pnl2,
-                                                   strategy=pos.strategy, creator=pos.creator)
-                log.info(f"  Sell recovered with max slippage: {tx2}")
-                self.notify.trade_alert("sell", pos.symbol, sol_received2,
-                                         pnl=sell_pnl2, reason=f"{reason} (retry)",
-                                         tx=tx2, balance=self.wallet.sol_balance,
-                                         daily_pnl=self.risk.daily_pnl)
+        bal_before = amount[0] if amount else None
+        sol_before = await self._sol_balance()
+        graduated = pos.graduated if is_emergency else await self._is_graduated(mint, pos)
+
+        sell_slippage = 40 if is_emergency else self.cfg.slippage_pct
+        sell_fee = (min(self.cfg.priority_fee_sol * 2, 0.01) if is_emergency
+                    else self.cfg.priority_fee_sol)
+        resend = not is_partial   # re-sending a partial sell would oversell
+
+        if graduated and self.cfg.use_jupiter:
+            routes = ["jupiter", "pump", "pump_max"]
+        else:
+            routes = ["pump", "jupiter", "pump_max"]
+
+        state = "not_sold"
+        for route in routes:
+            if route == "jupiter":
+                if not self.cfg.use_jupiter:
+                    continue
+                if not (pos.graduated or await self._is_graduated(mint, pos)):
+                    continue
+                if amount is None:
+                    continue   # cannot size a Jupiter sell without the balance
+                # Raw amount and decimals come from the token account itself;
+                # a separate decimals lookup that fails must never scale this.
+                raw_amount = int(amount[1] * sell_pct / 100)
+                if raw_amount <= 0:
+                    continue
+                log.info(f"  Selling {pos.symbol} via Jupiter (graduated)")
+                result = await self.jupiter.sell_token(
+                    mint, raw_amount,
+                    slippage_bps=self.cfg.jupiter_slippage_bps,
+                    use_jito=self.pump.use_jito,
+                    resend_on_timeout=resend,
+                )
+            elif route == "pump":
+                result = await self.pump.sell(
+                    mint, sell_pct=sell_pct,
+                    slippage=sell_slippage,
+                    priority_fee=sell_fee,
+                    skip_jito=is_emergency,
+                    resend_on_timeout=resend,
+                )
             else:
-                log.error(f"  SELL STUCK: {pos.symbol} — will retry next cycle")
-                if not hasattr(self, '_stuck_positions'):
-                    self._stuck_positions = {}
-                self._stuck_positions[mint] = self._stuck_positions.get(mint, 0) + 1
-                self.notify.send(
-                    f"ALERT: Cannot sell {pos.symbol} ({mint[:16]}...) — "
-                    f"will retry next poll cycle"
+                # Last resort: max slippage, skip Jito, higher fee
+                log.error(f"  Sell FAILED for {pos.symbol} — last-resort retry")
+                retry_fee = min(self.cfg.priority_fee_sol * 2,
+                                pos.sol_invested * 0.15)
+                result = await self.pump.sell(
+                    mint, sell_pct=sell_pct,
+                    slippage=50,
+                    priority_fee=retry_fee,
+                    skip_jito=True,
+                    resend_on_timeout=resend,
                 )
 
+            if result.sigs:
+                self._sell_sigs.setdefault(mint, []).extend(result.sigs)
+
+            state, sol_received, tokens_left, sig = await self._verify_sell(
+                mint, pos, result, bal_before, sol_before, sell_pct, is_partial)
+
+            if state == "sold":
+                await self._finalize_sell(mint, pos, sell_pct, is_partial, reason,
+                                          route, sol_received, tokens_left, sig)
+                return
+            if state == "unknown":
+                break   # outcome unverifiable — trying another venue could double-sell
+            log.warning(f"  Sell via {route} did not go through for {pos.symbol}")
+
+        if state == "unknown" and is_partial:
+            # Hold further partial sells until this one can no longer land.
+            self._partial_hold[mint] = {
+                "until": time.time() + self.PARTIAL_HOLD_SEC,
+                "bal_before": bal_before, "sell_pct": sell_pct, "reason": reason,
+            }
+            log.warning(f"  {pos.symbol}: partial sell outcome unknown — "
+                        f"holding further partial sells for {self.PARTIAL_HOLD_SEC}s")
+            return
+        self._mark_stuck(mint, pos, unknown=(state == "unknown"),
+                         emergency=is_emergency)
+
+    async def _verify_sell(self, mint: str, pos, result: TradeResult,
+                           bal_before: float | None, sol_before: float,
+                           sell_pct: int, is_partial: bool):
+        """Decide whether a sell really happened.
+
+        Returns (state, sol_received, tokens_left, signature) where state is
+        "sold", "not_sold" or "unknown".
+        """
+        owner = self.wallet.pubkey
+
+        if result.confirmed and result.sig:
+            tx = await self.pump.get_tx_result(result.sig, retries=4)
+            out = parse_tx_outcome(tx, owner, mint)
+            if out is None:
+                # Confirmed by signature status but the tx body is not
+                # readable: fall back to wallet deltas.
+                sol = await self._get_sol_received(sol_before, pos)
+                bal = await self._token_balance(mint)
+                self._forget_sell_sigs(mint, result.sigs)
+                return "sold", sol, bal, result.sig
+            if out.err is None and out.owner_found:
+                self._forget_sell_sigs(mint, result.sigs)
+                return "sold", max(out.sol_delta, 0.0), out.token_post, result.sig
+            if out.err is None and result.via_lightning:
+                self._lightning_wallet_mismatch(pos.symbol, result.sig)
+                return "unknown", 0.0, None, result.sig
+            # err is set: it did not execute — let the balance decide below
+
+        # Not confirmed: the token balance is the judge.
+        tries = 1 if result.failed else self.SELL_BALANCE_POLLS
+        bal = None
+        for i in range(tries):
+            bal = await self._token_balance(mint)
+            if bal is not None and bal_before is not None and bal_before > 0:
+                sold_fraction = (bal_before - bal) / bal_before
+                if sold_fraction >= (sell_pct / 100) * 0.5:
+                    # It landed despite the status. Read proceeds from the
+                    # sell transactions; wallet delta as a last resort.
+                    sol = await self._sol_from_sell_sigs(mint)
+                    if sol <= 0:
+                        sol = await self._get_sol_received(sol_before, pos, retries=1)
+                    self._sell_sigs.pop(mint, None)
+                    log.info(f"  {pos.symbol}: sell landed (balance "
+                             f"{bal_before:.0f} → {bal:.0f})")
+                    return "sold", sol, bal, result.sig
+            if i < tries - 1:
+                await asyncio.sleep(2)
+
+        if result.failed:
+            return "not_sold", 0.0, bal, ""
+        if bal is None or bal_before is None:
+            return "unknown", 0.0, None, result.sig
+        # Unknown status, balance unchanged so far. A full sell can safely be
+        # retried (a duplicate just fails); a partial one cannot.
+        return ("unknown" if is_partial else "not_sold"), 0.0, bal, result.sig
+
+    def _forget_sell_sigs(self, mint: str, sigs: list[str]):
+        """Drop signatures whose proceeds have been accounted for."""
+        remaining = [s for s in self._sell_sigs.get(mint, []) if s not in sigs]
+        if remaining:
+            self._sell_sigs[mint] = remaining
+        else:
+            self._sell_sigs.pop(mint, None)
+
+    async def _partial_hold_cleared(self, mint: str, pos) -> bool:
+        """True when a new partial sell may be sent.
+
+        While an earlier partial sell's outcome is unknown, wait until it can
+        no longer land; then record it if the balance shows it did.
+        """
+        hold = self._partial_hold.get(mint)
+        if not hold:
+            return True
+        if time.time() < hold["until"]:
+            return False
+        bal = await self._token_balance(mint)
+        if bal is None:
+            return False   # still cannot tell — keep holding
+        self._partial_hold.pop(mint, None)
+        before = hold.get("bal_before")
+        if before and before > 0:
+            sold_fraction = (before - bal) / before
+            if sold_fraction >= (hold["sell_pct"] / 100) * 0.5:
+                sol = await self._sol_from_sell_sigs(mint)
+                self._sell_sigs.pop(mint, None)
+                log.info(f"  {pos.symbol}: earlier partial sell did land — recording it")
+                await self._finalize_sell(mint, pos, hold["sell_pct"], True,
+                                          hold["reason"], "pump", sol, bal, "")
+                return False
+        return True
+
+    async def _finalize_sell(self, mint: str, pos, sell_pct: int,
+                             is_partial: bool, reason: str, route: str,
+                             sol_received: float, tokens_left: float | None,
+                             sig: str):
+        """Book a sell that verifiably happened."""
+        label = f"{reason} (jupiter)" if route == "jupiter" else reason
+        sell_pnl = None
+        if is_partial:
+            self.risk.partial_close(mint, sol_received=sol_received, reason=label)
+            # Keep the position in step with what is actually held, so the
+            # portfolio cap and later sells work from real numbers.
+            if tokens_left is not None and tokens_left >= 0:
+                pos.tokens = tokens_left
+            else:
+                pos.tokens *= (1 - sell_pct / 100)
+            pos.sol_invested *= (1 - sell_pct / 100)
+            self.risk.persist(pos)
+        else:
+            # Credit any earlier sell of this position that landed unconfirmed
+            sol_received += await self._sol_from_sell_sigs(mint)
+            self._sell_sigs.pop(mint, None)
+            self._partial_hold.pop(mint, None)
+            self._clear_stuck(mint)
+            sell_pnl = self.risk.close(mint, sol_received, reason, sig)
+            await self._on_position_closed(mint, pnl=sell_pnl,
+                                           strategy=pos.strategy, creator=pos.creator)
+
+        self.notify.trade_alert("sell", pos.symbol, sol_received,
+                                 pnl=sell_pnl, reason=label, tx=sig,
+                                 balance=await self._sol_balance(),
+                                 daily_pnl=self.risk.daily_pnl)
+
+    def _mark_stuck(self, mint: str, pos, unknown: bool = False,
+                    emergency: bool = False):
+        """Record a sell that could not be completed. The position stays open,
+        and further automatic sell attempts are held back (see _spawn_sell)."""
+        count = self._stuck_positions.get(mint, 0) + 1
+        self._stuck_positions[mint] = count
+        delay = (self.SELL_BACKOFF_SEC if count < self.STUCK_BACKOFF_AFTER
+                 else self.SELL_BACKOFF_LONG_SEC)
+        self._sell_backoff[mint] = (time.time() + delay, emergency)
+        why = "outcome unverifiable" if unknown else "sell failed"
+        log.error(f"  SELL STUCK: {pos.symbol} ({why}) — still holding, will retry")
+        if count == 1:
+            self.notify.send(
+                f"ALERT: Cannot sell {pos.symbol} ({mint[:16]}...) — {why}. "
+                f"Still holding the tokens; will retry."
+            )
+
+    def _clear_stuck(self, mint: str):
+        self._stuck_positions.pop(mint, None)
+        self._stuck_alerted.discard(mint)
+        self._sell_backoff.pop(mint, None)
+
     async def _is_graduated(self, mint: str, pos) -> bool:
-        """Check if a token has graduated, with caching."""
+        """Check if a token has graduated, with caching.
+
+        An RPC failure is "unknown": it is not cached and never sets the
+        graduated flag (which would suspend the stop-loss for 5 minutes).
+        """
         if pos.graduated:
             return True
         if mint in self._graduated_cache:
             return self._graduated_cache[mint]
         try:
             graduated = await self.onchain.is_graduated(mint)
-            self._graduated_cache[mint] = graduated
-            if graduated:
-                pos.graduated = True
-                if not pos.graduated_at:
-                    pos.graduated_at = time.time()
-                log.info(f"  {pos.symbol} has graduated from pump.fun")
-            return graduated
         except Exception as e:
             log.debug(f"  Graduation check error: {e}")
             return False
+        if graduated is None:
+            return False
+        self._graduated_cache[mint] = graduated
+        if graduated:
+            self.risk.mark_graduated(mint)
+            log.info(f"  {pos.symbol} has graduated from pump.fun")
+        return graduated
 
     # ══════════════════════════════════════════════════════════
     # TELEGRAM COMMANDS
@@ -2252,7 +2746,10 @@ class MemeBot:
 
     async def _poll_telegram_commands(self):
         """Poll Telegram events and route to TelegramUI."""
-        events = self.notify.poll_events()
+        if not self.notify.enabled:
+            return
+        # Synchronous HTTP call — keep it off the event loop
+        events = await asyncio.to_thread(self.notify.poll_events)
         for event in events:
             try:
                 await self.tg_ui.handle_event(event)
@@ -2265,7 +2762,7 @@ class MemeBot:
 
     async def _report_status(self):
         status = self.risk.get_status()
-        sol = self.wallet.get_sol_balance()
+        sol = await self._sol_balance()
 
         log.info(f"\n{'='*55}")
         log.info(f"  STATUS | SOL: {sol:.4f} | Positions: {status['positions']}")
@@ -2305,7 +2802,7 @@ class MemeBot:
             log.warning(f"  TX failures (10min): {failures}")
 
         # Positions
-        for mint, pos in self.risk.positions.items():
+        for mint, pos in list(self.risk.positions.items()):
             token = await self.market.get_token(mint)
             pnl = pos.pnl_pct(token.price_usd) if token else 0
             log.info(f"    {pos.symbol}: {pos.sol_invested:.4f} SOL | "
@@ -2343,6 +2840,20 @@ class MemeBot:
 
     async def _shutdown(self):
         log.info("  Shutting down...")
+        # Stop the WebSocket reader and the loops first, so no new trade can
+        # start while we are shutting down (and no task outlives the loop).
+        main_tasks = [t for t in getattr(self, "_main_tasks", []) if not t.done()]
+        for t in main_tasks:
+            t.cancel()
+        if main_tasks:
+            await asyncio.gather(*main_tasks, return_exceptions=True)
+        # Let in-flight trades finish recording before closing the database
+        pending = [t for t in self._bg_tasks if not t.done()]
+        if pending:
+            log.info(f"  Waiting for {len(pending)} in-flight trade task(s)...")
+            _done, still = await asyncio.wait(pending, timeout=45)
+            for t in still:
+                t.cancel()
         await self._report_status()
 
         # Save state

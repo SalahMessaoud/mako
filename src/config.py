@@ -42,9 +42,9 @@ EVENT_AUTHORITY = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp18C"
 PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 PUMPPORTAL_LIGHTNING_URL = "https://pumpportal.fun/api/trade"
 PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
-JUPITER_PRICE_URL = "https://price.jup.ag/v6/price"
+JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://lite-api.jup.ag/swap/v1/swap"
+JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3"
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 JITO_BUNDLE_URL = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
 
@@ -103,6 +103,14 @@ class Config:
     stale_exit_minutes: float = 10.0
     stale_exit_pct: float = 7.0
     graduated_trailing_2_pct: float = 35.0
+
+    # Peaked filters
+    peaked_growth_cap_pct: float = 200.0    # Hard reject above this growth %
+    peaked_age_multiplier: float = 20.0     # Max growth = age_min * this
+
+    # Safety: block a buy when on-chain safety data could not be read
+    # (RPC failure). False restores the old "proceed anyway" behaviour.
+    safety_fail_closed: bool = True
 
     # Momentum quality filters
     min_momentum_confidence: float = 0.65
@@ -211,6 +219,9 @@ class Config:
             stale_exit_minutes=_safe_float("STALE_EXIT_MINUTES", "10"),
             stale_exit_pct=_safe_float("STALE_EXIT_PCT", "7"),
             graduated_trailing_2_pct=_safe_float("GRADUATED_TRAILING_2_PCT", "35"),
+            peaked_growth_cap_pct=_safe_float("PEAKED_GROWTH_CAP_PCT", "200"),
+            peaked_age_multiplier=_safe_float("PEAKED_AGE_MULTIPLIER", "20"),
+            safety_fail_closed=os.getenv("SAFETY_FAIL_CLOSED", "true").lower() == "true",
             min_momentum_confidence=_safe_float("MIN_MOMENTUM_CONFIDENCE", "0.65"),
             min_momentum_sol_in_curve=_safe_float("MIN_MOMENTUM_SOL_IN_CURVE", "15"),
             min_momentum_txns=_safe_int("MIN_MOMENTUM_TXNS", "30"),
@@ -270,6 +281,10 @@ class Config:
             issues.append("MAX_CONCURRENT_POSITIONS must be > 0")
         if self.daily_loss_limit <= 0:
             issues.append("DAILY_LOSS_LIMIT_SOL must be > 0")
+        if self.peaked_growth_cap_pct <= 0:
+            issues.append("PEAKED_GROWTH_CAP_PCT must be > 0")
+        if self.peaked_age_multiplier <= 0:
+            issues.append("PEAKED_AGE_MULTIPLIER must be > 0")
         if self.max_buy_sol > self.max_portfolio_sol:
             issues.append(f"MAX_BUY_SOL ({self.max_buy_sol}) must be <= MAX_PORTFOLIO_SOL ({self.max_portfolio_sol})")
         return issues

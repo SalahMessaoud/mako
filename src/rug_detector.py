@@ -64,7 +64,10 @@ class RugDetector:
         self._monitored[mint] = _MonitoredToken(
             mint=mint,
             creator=creator,
-            baseline_curve_sol=max(curve_sol, 0.1),
+            # 0 = baseline not known yet (the read failed). It is filled in by
+            # the first successful poll instead of using a fake floor that
+            # would silently disable curve-drop detection.
+            baseline_curve_sol=max(curve_sol, 0.0),
             graduated=graduated,
             curve_pct=curve_pct,
         )
@@ -192,7 +195,12 @@ class RugDetector:
             # ── Bonding curve SOL drop ────────────────────────
             # Skip for graduated tokens — curve draining to 0 is expected
             # after migration to Raydium
-            if result.is_pump_token and mon.baseline_curve_sol > 0 and not mon.graduated:
+            if (result.is_pump_token and mon.baseline_curve_sol <= 0
+                    and not mon.graduated and result.bonding_curve_sol > 0):
+                mon.baseline_curve_sol = result.bonding_curve_sol
+                log.debug(f"  Rug monitor baseline set late: {symbol} "
+                          f"{mon.baseline_curve_sol:.2f} SOL")
+            elif result.is_pump_token and mon.baseline_curve_sol > 0 and not mon.graduated:
                 current_sol = result.bonding_curve_sol
                 drop_pct = ((mon.baseline_curve_sol - current_sol)
                             / mon.baseline_curve_sol * 100)
@@ -200,7 +208,10 @@ class RugDetector:
                 if drop_pct >= self._curve_drop_pct:
                     # Before flagging, check if this is just graduation
                     try:
-                        if await self.onchain.is_graduated(mint):
+                        graduated = await self.onchain.is_graduated(mint)
+                        if graduated is None:
+                            raise RuntimeError("graduation status unknown")
+                        if graduated:
                             mon.graduated = True
                             log.info(f"  {symbol} graduated — curve drain is normal, skipping rug flag")
                         else:

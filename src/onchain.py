@@ -25,6 +25,13 @@ PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_BONDING_SEED = b"bonding-curve"
 
 
+class RpcUnavailable(Exception):
+    """No RPC gave a usable answer — the on-chain state is UNKNOWN.
+
+    Distinct from "the account does not exist", which is a real answer.
+    """
+
+
 @dataclass
 class BondingCurveState:
     """Full bonding curve state for momentum evaluation."""
@@ -54,6 +61,16 @@ class OnChainResult:
     is_pump_token: bool = False
     warnings: list = None
     score: int = 0  # 0-100
+    # Which reads actually succeeded. A False here means the matching fields
+    # still hold their defaults and say NOTHING about the token.
+    mint_read_ok: bool = False
+    holders_read_ok: bool = False
+    creator_read_ok: bool = False
+
+    @property
+    def verified(self) -> bool:
+        """True when the safety-critical reads (mint + holders) succeeded."""
+        return self.mint_read_ok and self.holders_read_ok
 
     def __post_init__(self):
         if self.warnings is None:
@@ -103,7 +120,10 @@ class OnChainAnalyzer:
             log.warning(f"On-chain analysis error for {mint[:8]}: {e}")
             result.warnings.append(f"Analysis error: {str(e)[:50]}")
 
-        self._cache[mint] = (time.time(), result)
+        # Only cache complete results — a failed read must be retried, not
+        # served again for 30 seconds as if it were real data.
+        if result.verified:
+            self._cache[mint] = (time.time(), result)
         # Evict stale analysis cache entries
         if len(self._cache) > 500:
             cutoff = time.time() - self._cache_ttl * 3
@@ -202,8 +222,13 @@ class OnChainAnalyzer:
             log.debug(f"Bonding curve state error for {mint[:8]}: {e}")
             return None
 
-    async def is_graduated(self, mint: str) -> bool:
-        """Check if a pump.fun token has graduated (bonding curve complete)."""
+    async def is_graduated(self, mint: str) -> bool | None:
+        """Check if a pump.fun token has graduated (bonding curve complete).
+
+        Returns True/False when the chain answered, None when the RPC failed.
+        None must never be treated as "graduated": doing so would suspend the
+        stop-loss and route sells to the wrong venue on a mere rate limit.
+        """
         try:
             from solders.pubkey import Pubkey
             mint_pk = Pubkey.from_string(mint)
@@ -213,9 +238,9 @@ class OnChainAnalyzer:
                 [PUMP_BONDING_SEED, bytes(mint_pk)], pump_pk
             )
 
-            info = await self._get_account_info(str(pda))
+            info = await self._get_account_info_strict(str(pda))
             if not info:
-                return True
+                return True   # RPC answered: no bonding curve account
 
             data = info.get("data", [])
             if not data:
@@ -226,9 +251,12 @@ class OnChainAnalyzer:
                 complete = raw[48]
                 return bool(complete)
             return False
+        except RpcUnavailable:
+            log.debug(f"is_graduated: RPC unavailable for {mint[:8]}")
+            return None
         except Exception as e:
             log.debug(f"is_graduated check error for {mint[:8]}: {e}")
-            return False
+            return None
 
     async def get_recent_tx_count(self, mint: str, seconds: int = 300) -> int:
         """Count recent transactions on a token's bonding curve PDA."""
@@ -344,18 +372,25 @@ class OnChainAnalyzer:
             log.debug(f"Batch bonding curve error: {e}")
             return {}
 
-    async def get_token_decimals(self, mint: str) -> int:
-        """Read token decimals from mint account."""
+    async def get_token_decimals(self, mint: str) -> int | None:
+        """Read token decimals from the mint account. None if unreadable.
+
+        Never guess: a wrong decimals value scales a sell amount by 10^n.
+        """
         try:
             result = OnChainResult()
             await self._check_mint_account(mint, result)
-            return result.decimals
+            return result.decimals if result.mint_read_ok else None
         except Exception:
-            return 6  # pump.fun default
+            return None
 
     # ── RPC Helpers ───────────────────────────────────────────
 
-    async def _rpc_call(self, method: str, params: list) -> dict | None:
+    async def _rpc_call_strict(self, method: str, params: list):
+        """RPC call that raises RpcUnavailable instead of returning None.
+
+        A None return therefore always means the chain said "nothing there".
+        """
         for url in [self.rpc_url, self.fallback_rpc_url]:
             if not url:
                 continue
@@ -366,33 +401,53 @@ class OnChainAnalyzer:
                 })
                 data = resp.json()
                 if "error" in data:
-                    err = data["error"]
-                    if isinstance(err, dict) and err.get("code") == -32429:
-                        log.debug(f"RPC rate limited, trying fallback")
-                        continue
-                    log.debug(f"RPC error: {err}")
-                    return None
-                return data.get("result")
+                    log.debug(f"RPC error ({method}): {data['error']}")
+                    continue  # try the fallback
+                if "result" not in data:
+                    continue
+                return data["result"]
             except Exception as e:
-                log.debug(f"RPC call failed ({url[:30]}...): {e}")
+                log.debug(f"RPC call failed ({url[:30]}...): {type(e).__name__}")
                 continue
-        return None
+        raise RpcUnavailable(method)
 
-    async def _get_account_info(self, address: str, encoding: str = "base64") -> dict | None:
-        result = await self._rpc_call("getAccountInfo", [
+    async def _rpc_call(self, method: str, params: list) -> dict | None:
+        """Lenient RPC call: None on failure. Use only where a miss is harmless."""
+        try:
+            return await self._rpc_call_strict(method, params)
+        except RpcUnavailable:
+            return None
+
+    async def _get_account_info_strict(self, address: str,
+                                       encoding: str = "base64") -> dict | None:
+        """Account info, or None if the account does not exist.
+
+        Raises RpcUnavailable when the RPC could not answer.
+        """
+        result = await self._rpc_call_strict("getAccountInfo", [
             address, {"encoding": encoding, "commitment": "confirmed"}
         ])
         if result and result.get("value"):
             return result["value"]
         return None
 
+    async def _get_account_info(self, address: str, encoding: str = "base64") -> dict | None:
+        try:
+            return await self._get_account_info_strict(address, encoding)
+        except RpcUnavailable:
+            return None
+
     # ── Mint Account Analysis ─────────────────────────────────
 
     async def _check_mint_account(self, mint: str, result: OnChainResult):
         """Read mint account to check authorities and supply."""
-        info = await self._get_account_info(mint)
+        try:
+            info = await self._get_account_info_strict(mint)
+        except RpcUnavailable:
+            result.warnings.append("Could not read mint account (RPC unavailable)")
+            return
         if not info:
-            result.warnings.append("Could not read mint account")
+            result.warnings.append("Mint account not found")
             return
 
         data = info.get("data", [])
@@ -419,6 +474,7 @@ class OnChainAnalyzer:
             result.freeze_authority_revoked = (freeze_auth_option == 0)
             if not result.freeze_authority_revoked:
                 result.warnings.append("Freeze authority active — can freeze your tokens")
+            result.mint_read_ok = True
 
         except Exception as e:
             log.debug(f"Mint parse error: {e}")
@@ -439,6 +495,7 @@ class OnChainAnalyzer:
             result.warnings.append("Could not fetch holder data")
             return
 
+        result.holders_read_ok = True
         accounts = resp["value"]
         if not accounts:
             return
@@ -571,7 +628,8 @@ class OnChainAnalyzer:
             resp = await self._rpc_call("getSignaturesForAddress", [
                 creator, {"limit": 100, "commitment": "confirmed"}
             ])
-            if resp:
+            if resp is not None:
+                result.creator_read_ok = True
                 result.creator_token_count = len(resp)
                 if len(resp) >= 50:
                     result.warnings.append(

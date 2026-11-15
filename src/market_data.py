@@ -169,8 +169,10 @@ class MarketData:
             from config import WSOL
             resp = await self.http.get(JUPITER_PRICE_URL, params={"ids": WSOL}, timeout=5)
             resp.raise_for_status()
-            data = resp.json().get("data", {}).get(WSOL, {})
-            price = float(data.get("price", 0))
+            body = resp.json()
+            # Price API v3: {mint: {"usdPrice": ...}}. Older: {"data": {mint: {"price": ...}}}
+            entry = body.get(WSOL) or (body.get("data") or {}).get(WSOL) or {}
+            price = float(entry.get("usdPrice") or entry.get("price") or 0)
             if price > 0:
                 self._sol_price = price
                 self._sol_price_time = now

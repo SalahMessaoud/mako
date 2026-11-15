@@ -21,13 +21,15 @@ BANNER = """
 
 def main():
     parser = argparse.ArgumentParser(description="Mako — Solana Trading Engine")
-    parser.add_argument("--paper", action="store_true", default=True, help="Paper trading (default)")
+    parser.add_argument("--paper", action="store_true",
+                        help="Force paper trading (overrides TRADING_MODE in .env)")
     parser.add_argument("--live", action="store_true", help="Live trading with real SOL")
     parser.add_argument("--strategy", type=str, help="Strategy: sniper/momentum/copy_trade/graduation/multi")
     parser.add_argument("--max-sol", type=float, help="Max SOL per trade")
     parser.add_argument("--interval", type=int, help="Poll interval in seconds")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("--db", type=str, default="bot_state.db", help="Database path")
+    parser.add_argument("--db", type=str, default=None,
+                        help="Database path (default: $BOT_DB_PATH or bot_state.db)")
     args = parser.parse_args()
 
     # Logging
@@ -55,18 +57,18 @@ def main():
     # Config
     config = Config.from_env()
 
+    if args.live and args.paper:
+        parser.error("--live and --paper are mutually exclusive")
     if args.live:
         config.paper_trading = False
+    if args.paper:
+        config.paper_trading = True
     if args.strategy:
         config.strategy = args.strategy
     if args.max_sol:
         config.max_buy_sol = args.max_sol
     if args.interval:
         config.poll_interval = args.interval
-
-    # Set DB path
-    import os
-    os.environ["BOT_DB_PATH"] = args.db
 
     # Validate
     issues = config.validate()
@@ -82,7 +84,9 @@ def main():
     log.info(f"  Max buy: {config.max_buy_sol} SOL")
     log.info(f"  Stop-loss: {config.stop_loss_pct}% | TP1: {config.take_profit_pct}% | TP2: {config.take_profit_2_pct}%")
     log.info(f"  On-chain safety: ENABLED")
-    log.info(f"  Crash recovery: ENABLED (DB: {args.db})")
+    import os
+    db_path = args.db or os.getenv("BOT_DB_PATH", "bot_state.db")
+    log.info(f"  Crash recovery: ENABLED (DB: {db_path})")
     log.info(f"  Loss cooldowns: ENABLED")
     log.info(f"  Dynamic sizing: ENABLED")
 
@@ -101,7 +105,11 @@ def main():
             sys.exit(0)
 
     # Run
-    bot = MemeBot(config)
+    try:
+        bot = MemeBot(config, db_path=db_path)
+    except RuntimeError as e:
+        log.error(f"  Startup refused: {e}")
+        sys.exit(1)
     bot.run()
 
 

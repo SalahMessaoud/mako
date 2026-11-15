@@ -1,5 +1,6 @@
 """Risk management — position tracking, exits, loss cooldown, dynamic sizing, persistence."""
 
+import json
 import time
 import logging
 from dataclasses import dataclass
@@ -33,6 +34,9 @@ class Position:
     original_sol_invested: float = 0.0  # original buy amount (never reduced)
     partial_sol_received: float = 0.0   # total SOL received from partial sells
     stop_loss_first_seen: float = 0.0   # timestamp when price first hit stop threshold
+    catastrophic_first_seen: float = 0.0  # timestamp when price first hit -50% during grace
+    buy_unverified: bool = False    # buy outcome was unknown — tokens not yet seen on-chain
+    last_balance_check: float = 0.0  # throttle for on-chain balance reconciliation
 
     @property
     def age_sec(self) -> float: return time.time() - self.entry_time
@@ -88,8 +92,9 @@ class RiskManager:
         self.daily_trades: int = 0
         self.closed_trades: list[dict] = []
 
-        # Load persisted daily pnl
+        # Load persisted daily pnl and trade count (survive restarts)
         self.daily_pnl = db.get_daily_pnl()
+        self.daily_trades = db.count_buys_today()
 
     # ── Crash Recovery ────────────────────────────────────────
 
@@ -100,23 +105,29 @@ class RiskManager:
         for row in saved:
             extra = {}
             try:
-                import json
                 extra = json.loads(row.get("extra", "{}") or "{}")
             except Exception:
                 pass
             pos = Position(
                 mint=row["mint"], symbol=row["symbol"],
-                entry_price=row["entry_price"],
-                entry_sol_price=row["entry_sol_price"],
-                tokens=row["tokens"], sol_invested=row["sol_invested"],
+                entry_price=row["entry_price"] or 0.0,
+                entry_sol_price=row["entry_sol_price"] or 0.0,
+                tokens=row["tokens"] or 0.0, sol_invested=row["sol_invested"],
                 entry_time=row["entry_time"], strategy=row["strategy"],
-                peak_price=row["peak_price"],
+                peak_price=row["peak_price"] or 0.0,
                 partial_taken=bool(row["partial_taken"]),
                 auto_sell_at=row["auto_sell_at"],
                 tx_signature=row.get("tx_signature", ""),
                 creator=extra.get("creator", ""),
                 original_sol_invested=extra.get("original_sol_invested", row["sol_invested"]),
                 partial_sol_received=extra.get("partial_sol_received", 0.0),
+                graduated=bool(extra.get("graduated", False)),
+                graduated_at=extra.get("graduated_at", 0.0) or 0.0,
+                tp2_taken=bool(extra.get("tp2_taken", False)),
+                # A row still marked pending means we crashed between sending
+                # the buy and resolving it: the tokens are unconfirmed.
+                buy_unverified=bool(extra.get("buy_unverified", False)
+                                    or extra.get("pending", False)),
             )
             self.positions[pos.mint] = pos
             recovered += 1
@@ -126,17 +137,85 @@ class RiskManager:
             log.info(f"  Recovered {recovered} positions from database")
         return recovered
 
+    # ── Persistence ───────────────────────────────────────────
+
+    @staticmethod
+    def _extra(pos: Position) -> dict:
+        """The one place that decides what goes in the `extra` JSON column."""
+        return {
+            "creator": pos.creator,
+            "original_sol_invested": pos.original_sol_invested,
+            "partial_sol_received": pos.partial_sol_received,
+            "graduated": pos.graduated,
+            "graduated_at": pos.graduated_at,
+            "tp2_taken": pos.tp2_taken,
+            "buy_unverified": pos.buy_unverified,
+        }
+
+    def persist(self, pos: Position):
+        """Write a position's mutable state to the database."""
+        self.db.update_position(
+            pos.mint,
+            entry_price=pos.entry_price, entry_sol_price=pos.entry_sol_price,
+            tokens=pos.tokens, sol_invested=pos.sol_invested,
+            peak_price=pos.peak_price, partial_taken=int(pos.partial_taken),
+            extra=json.dumps(self._extra(pos)),
+        )
+
+    def set_entry_price(self, mint: str, price_usd: float, price_sol: float = 0.0):
+        """Late-bind an entry price for a position opened without one.
+
+        A position with entry_price 0 has no stop-loss; this arms it from the
+        first price we manage to read.
+        """
+        pos = self.positions.get(mint)
+        if not pos or price_usd <= 0:
+            return
+        pos.entry_price = price_usd
+        if price_sol > 0:
+            pos.entry_sol_price = price_sol
+        pos.peak_price = max(pos.peak_price, price_usd)
+        self.persist(pos)
+        log.info(f"  Entry price set late for {pos.symbol}: ${price_usd:.10f}")
+
+    def mark_graduated(self, mint: str):
+        pos = self.positions.get(mint)
+        if not pos or pos.graduated:
+            return
+        pos.graduated = True
+        if not pos.graduated_at:
+            pos.graduated_at = time.time()
+        self.persist(pos)
+
+    def discard(self, mint: str, reason: str = "") -> bool:
+        """Drop a position WITHOUT booking PnL.
+
+        For a buy that never landed: no SOL was spent, so recording a loss
+        would poison daily PnL, loss streaks and the creator blacklist.
+        """
+        pos = self.positions.pop(mint, None)
+        if not pos:
+            return False
+        self.db.delete_position(mint)
+        self.daily_trades = max(self.daily_trades - 1, 0)
+        log.warning(f"  Discarded {pos.symbol} without PnL [{reason}]")
+        return True
+
     # ── Position Management ───────────────────────────────────
 
-    def can_open(self, sol_amount: float, strategy: str = "") -> tuple[bool, str]:
+    def can_open(self, sol_amount: float, strategy: str = "",
+                 reserved_sol: float = 0.0,
+                 reserved_count: int = 0) -> tuple[bool, str]:
+        """`reserved_*` cover buys already approved but not yet opened, so
+        concurrent buys cannot each pass the caps and overshoot them."""
         if self.daily_pnl <= -self.cfg.daily_loss_limit:
             return False, f"Daily loss limit ({self.daily_pnl:.4f} SOL)"
         if (self.cfg.max_daily_trades > 0
-                and self.daily_trades >= self.cfg.max_daily_trades):
+                and self.daily_trades + reserved_count >= self.cfg.max_daily_trades):
             return False, f"Daily trade cap ({self.daily_trades}/{self.cfg.max_daily_trades})"
-        if len(self.positions) >= self.cfg.max_concurrent:
+        if len(self.positions) + reserved_count >= self.cfg.max_concurrent:
             return False, f"Max positions ({self.cfg.max_concurrent})"
-        total = sum(p.sol_invested for p in self.positions.values())
+        total = sum(p.sol_invested for p in self.positions.values()) + reserved_sol
         if total + sol_amount > self.cfg.max_portfolio_sol:
             return False, f"Portfolio limit ({total:.3f} + {sol_amount:.3f})"
 
@@ -154,7 +233,8 @@ class RiskManager:
         return True, "ok"
 
     def calc_size(self, sol_balance: float, confidence: float = 0.5,
-                  strategy: str = "", wallet: str = "") -> float:
+                  strategy: str = "", wallet: str = "",
+                  reserved_sol: float = 0.0) -> float:
         """
         Dynamic position sizing based on:
         - Available balance
@@ -163,7 +243,7 @@ class RiskManager:
         - Loss streak (reduce size after losses)
         - Wallet score (for copy trades)
         """
-        total = sum(p.sol_invested for p in self.positions.values())
+        total = sum(p.sol_invested for p in self.positions.values()) + reserved_sol
         remaining = self.cfg.max_portfolio_sol - total
         # Strategy-specific size caps
         if strategy == "momentum":
@@ -216,38 +296,43 @@ class RiskManager:
     def open(self, mint: str, symbol: str, price_usd: float,
              price_sol: float, tokens: float, sol: float,
              strategy: str, auto_sell_sec: int = 0,
-             tx_signature: str = "", creator: str = "") -> Position:
+             tx_signature: str = "", creator: str = "",
+             graduated: bool = False,
+             buy_unverified: bool = False) -> Position:
         if mint in self.positions:
             return self.positions[mint]
+        now = time.time()
         pos = Position(
-            mint=mint, symbol=symbol, entry_price=price_usd,
-            entry_sol_price=price_sol, tokens=tokens,
-            sol_invested=sol, entry_time=time.time(),
-            strategy=strategy, peak_price=price_usd,
-            auto_sell_at=(time.time() + auto_sell_sec) if auto_sell_sec > 0 else 0,
+            mint=mint, symbol=symbol, entry_price=price_usd or 0.0,
+            entry_sol_price=price_sol or 0.0, tokens=tokens or 0.0,
+            sol_invested=sol, entry_time=now,
+            strategy=strategy, peak_price=price_usd or 0.0,
+            auto_sell_at=(now + auto_sell_sec) if auto_sell_sec > 0 else 0,
             tx_signature=tx_signature, creator=creator,
             original_sol_invested=sol,
+            graduated=graduated, graduated_at=now if graduated else 0.0,
+            buy_unverified=buy_unverified,
         )
         self.positions[mint] = pos
         self.daily_trades += 1
 
         # Persist to DB
         self.db.save_position(
-            mint=mint, symbol=symbol, entry_price=price_usd,
-            entry_sol_price=price_sol, tokens=tokens, sol_invested=sol,
-            entry_time=pos.entry_time, strategy=strategy,
-            peak_price=price_usd, partial_taken=False,
+            mint=mint, symbol=symbol, entry_price=pos.entry_price,
+            entry_sol_price=pos.entry_sol_price, tokens=pos.tokens,
+            sol_invested=sol, entry_time=pos.entry_time, strategy=strategy,
+            peak_price=pos.peak_price, partial_taken=False,
             auto_sell_at=pos.auto_sell_at, tx_signature=tx_signature,
-            extra={"creator": creator} if creator else None,
+            extra=self._extra(pos),
         )
         self.db.log_trade(
             mint=mint, symbol=symbol, strategy=strategy, action="buy",
-            sol_amount=sol, tokens=tokens, price_usd=price_usd,
+            sol_amount=sol, tokens=pos.tokens, price_usd=pos.entry_price,
             tx_signature=tx_signature,
         )
 
         log.info(f"  Position opened: {symbol} | {sol:.4f} SOL | "
-                 f"${price_usd:.10f} | {strategy}")
+                 f"${pos.entry_price:.10f} | {strategy}")
         return pos
 
     def close(self, mint: str, sol_received: float, reason: str = "",
@@ -324,21 +409,20 @@ class RiskManager:
             )
             log.info(f"  Partial sell {pos.symbol}: +{sol_received:.4f} SOL [{reason}] "
                      f"(total partials: {pos.partial_sol_received:.4f} SOL)")
-        import json
-        extra = json.dumps({
-            "creator": pos.creator,
-            "original_sol_invested": pos.original_sol_invested,
-            "partial_sol_received": pos.partial_sol_received,
-        })
-        self.db.update_position(mint, partial_taken=1, extra=extra)
+        self.persist(pos)
         return True
 
     # ── Exit Signal Checks ────────────────────────────────────
 
-    def check_exits(self, mint: str, current_price: float) -> tuple[str, float]:
+    def check_exits(self, mint: str, current_price: float,
+                    noisy: bool = False) -> tuple[str, float]:
+        """`noisy=True` marks a single-trade implied price (WebSocket). Such
+        prices must not start, satisfy or reset the stop-loss confirmation
+        timer unless WS stop-losses are explicitly enabled."""
         pos = self.positions.get(mint)
         if not pos:
             return "none", 0
+        stop_timer_ok = (not noisy) or self.cfg.ws_stop_loss_enabled
 
         pos.update_peak(current_price)
         pnl = pos.pnl_pct(current_price)
@@ -386,7 +470,10 @@ class RiskManager:
                 if curve_drop > 15:
                     return "curve_dump", 100
             # Otherwise, let it ride through the dip
-            pos.stop_loss_first_seen = 0.0  # reset while protected
+            if stop_timer_ok:
+                pos.stop_loss_first_seen = 0.0  # reset while protected
+        elif not stop_timer_ok:
+            pass  # noisy price: leave the confirmation timer untouched
         elif pnl <= -stop:
             now = time.time()
             # Confirm dip: require price to stay below stop for 8s
@@ -412,6 +499,7 @@ class RiskManager:
                 # Post-graduation hold: sell only 50% at TP2, let the rest ride
                 # with a wider trailing stop. Graduated tokens with volume can 10x+.
                 pos.tp2_taken = True
+                self.persist(pos)
                 return "take_profit_graduated", 50
             return "take_profit_full", 100
 
